@@ -12,6 +12,7 @@ import (
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/tdsync"
 	"github.com/gotd/td/telegram/auth"
+	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
 )
 
@@ -102,13 +103,45 @@ func (c *Client) reconnectUntilClosed(ctx context.Context) error {
 		return nil
 	}, b, func(err error, timeout time.Duration) {
 		c.log.Info("Restarting connection", zap.Error(err), zap.Duration("backoff", timeout))
-
-		c.connMux.Lock()
-		// Some PFS errors require dropping persisted keys before recreating conn.
-		c.handlePrimaryConnDead(err)
-		c.conn = c.createPrimaryConn(nil)
-		c.connMux.Unlock()
+		c.restartPrimaryConn(err)
 	})
+}
+
+// restartPrimaryConn replaces the dead primary conn with a fresh one (in-place
+// reconnect) and schedules an updates resync: a continued-session reconnect may
+// produce no new_session_created on the new conn (hence no onSession edge), so
+// the conn-swap path must request the resync itself.
+func (c *Client) restartPrimaryConn(err error) {
+	c.connMux.Lock()
+	// Some PFS errors require dropping persisted keys before recreating conn.
+	c.handlePrimaryConnDead(err)
+	c.conn = c.createPrimaryConn(nil)
+	c.connMux.Unlock()
+
+	c.resyncUpdates()
+}
+
+// resyncUpdates pushes a synthetic UpdatesTooLong into the update handler.
+// telegram/updates maps UpdatesTooLong to a forced getDifference, so this
+// resynchronizes the updates state after a connectivity edge. Mirrors the
+// official Telegram Android client (tgnet), which forces getDifference on
+// every reconnect: updates pushed by the server while the transport was down
+// (or addressed to a rotated session_id) are otherwise invisible until the
+// next pts gap or the 15-minute idle timer.
+//
+// Asynchronous by design: it is called from conn lifecycle edges (session
+// handler, reconnect notify), where blocking on a full updates queue could
+// deadlock the very teardown/reconnect that is supposed to drain that queue.
+// The goroutine is bounded by c.ctx via processUpdates.
+func (c *Client) resyncUpdates() {
+	if c.noUpdatesMode {
+		return
+	}
+	go func() {
+		if err := c.processUpdates(&tg.UpdatesTooLong{}); err != nil {
+			c.log.Debug("Failed to push synthetic UpdatesTooLong", zap.Error(err))
+		}
+	}()
 }
 
 func (c *Client) onReady() {

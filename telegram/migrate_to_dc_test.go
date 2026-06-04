@@ -110,9 +110,11 @@ func newMigrationClient(t *testing.T, h migrationTestHandler) *Client {
 		session: pool.NewSyncSession(pool.Session{
 			DC: 2,
 		}),
-		newConnBackoff:   defaultBackoff(clock.System),
-		ctx:              context.Background(),
-		cancel:           func() {},
+		newConnBackoff: defaultBackoff(clock.System),
+		ctx:            context.Background(),
+		cancel:         func() {},
+		// resyncUpdates fires from onSession; a nil updateHandler would panic.
+		updateHandler:    UpdateHandlerFunc(func(_ context.Context, _ tg.UpdatesClass) error { return nil }),
 		migrationTimeout: 10 * time.Second,
 	}
 	client.init()

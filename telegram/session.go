@@ -137,6 +137,11 @@ func (c *Client) onSession(cfg tg.Config, s mtproto.Session) error {
 	// after connMux.Unlock so replay RPCs do not run under connMux.
 	c.replayLiveRequests()
 
+	// Force the updates manager to refetch the difference on every session
+	// edge (reconnect's new_session_created, in-conn recreateSession). See
+	// resyncUpdates for rationale.
+	c.resyncUpdates()
+
 	if err := c.saveSession(cfg, s); err != nil {
 		return errors.Wrap(err, "save")
 	}

@@ -15,6 +15,7 @@ import (
 	"github.com/gotd/td/mtproto"
 	"github.com/gotd/td/pool"
 	"github.com/gotd/td/telegram/internal/manager"
+	"github.com/gotd/td/tg"
 )
 
 type fingerprintNotFoundConn struct{}
@@ -70,11 +71,18 @@ func TestClient_reconnectUntilClosed(t *testing.T) {
 func TestClient_reconnectUntilClosedPFSDropResetsStoredKey(t *testing.T) {
 	key := crypto.Key{1}.WithID()
 	dcID := 2
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
 	client := Client{
 		newConnBackoff: func() backoff.BackOff {
 			return backoff.NewConstantBackOff(time.Nanosecond)
 		},
 		log: zap.NewNop(),
+		// resyncUpdates fires an async goroutine that calls processUpdates;
+		// a nil updateHandler would panic, so wire a no-op one here.
+		updateHandler: UpdateHandlerFunc(func(_ context.Context, _ tg.UpdatesClass) error { return nil }),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	client.init()
 	client.session = pool.NewSyncSession(pool.Session{DC: dcID})
@@ -99,8 +107,6 @@ func TestClient_reconnectUntilClosedPFSDropResetsStoredKey(t *testing.T) {
 	})
 	client.conn = pfsDropConn{}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
-	defer cancel()
 	require.Error(t, client.reconnectUntilClosed(ctx))
 
 	// Both primary and per-DC cached sessions should be wiped for clean restart.
