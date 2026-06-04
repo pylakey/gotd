@@ -166,7 +166,19 @@ func (c *Conn) trackInvoke() func() {
 
 // Run initialize connection.
 func (c *Conn) Run(ctx context.Context) (err error) {
-	defer c.dead.Signal()
+	// Defers run in LIFO order: dead.Signal (registered last) fires FIRST on
+	// unwind, so by the time carryLiveSession drives the shutdown OnSession
+	// edge — and the store-and-resend replay goroutines it spawns reach
+	// waitSession — this conn already reports dead. The replay then gets a
+	// deterministic pool.ErrConnDead ("never reached the server", no attempt
+	// burned) instead of hitting the force-closed engine.
+	//
+	// Carry the live session (including the current content seqno) out of the
+	// dying connection so the next reconnect to this DC continues the sequence
+	// instead of resuming from the seqno snapshotted once at new_session_created
+	// time. Without this the resumed seqno is stale-low and the server rejects
+	// it (bad_msg code 32), degrading every reconnect to a fresh session.
+	defer c.carryLiveSession()
 	defer func() {
 		if err != nil && ctx.Err() == nil {
 			c.log.Debug("Connection dead", zap.Error(err))
@@ -175,12 +187,7 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 			}
 		}
 	}()
-	// Carry the live session (including the current content seqno) out of the
-	// dying connection so the next reconnect to this DC continues the sequence
-	// instead of resuming from the seqno snapshotted once at new_session_created
-	// time. Without this the resumed seqno is stale-low and the server rejects
-	// it (bad_msg code 32), degrading every reconnect to a fresh session.
-	defer c.carryLiveSession()
+	defer c.dead.Signal()
 	return c.proto.Run(ctx, func(ctx context.Context) error {
 		// Signal death on init error to unblock waiters in waitSession/OnSession.
 		err := c.init(ctx)
@@ -214,6 +221,15 @@ func (c *Conn) carryLiveSession() {
 }
 
 func (c *Conn) waitSession(ctx context.Context) error {
+	// A dead conn must never report readiness: on a conn that was ready and
+	// then died both gotConfig and dead are signaled, and select picks among
+	// ready cases at random. Store-and-resend relies on a deterministic
+	// pool.ErrConnDead from a dying conn (see Client.replayLiveRequests).
+	select {
+	case <-c.dead.Ready():
+		return pool.ErrConnDead
+	default:
+	}
 	select {
 	// Connection is considered ready only after mode-specific init succeeded.
 	case <-c.gotConfig.Ready():
