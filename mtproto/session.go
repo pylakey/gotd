@@ -83,9 +83,10 @@ func (c *Conn) newSessionID() error {
 //
 // This is invoked only on the recreate triggers: bad_msg_notification codes
 // 19/32/33/64, a downward server-time correction on codes 16/17 (a lower
-// offset would otherwise emit a lower msg_id mid-session), and receipt of an
-// already-processed / too-old inbound msg_id. A plain TCP reconnect must never
-// call it.
+// offset would otherwise emit a lower msg_id mid-session), and an inbound
+// msg_id created too far in the past. A duplicate / too-low inbound msg_id is
+// ignored without rotation (server retransmit, see mtproto/read.go). A plain
+// TCP reconnect must never call it.
 func (c *Conn) recreateSession() error {
 	id, err := crypto.RandInt64(c.rand)
 	if err != nil {

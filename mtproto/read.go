@@ -28,12 +28,14 @@ const (
 var errRejected = errors.New("message rejected")
 
 // errStaleMessageID marks the subset of rejections that signal our inbound
-// msg_id window has diverged from the server's: an already-processed
-// (duplicate / too-low) msg_id or a msg_id created too far in the past. These
-// are recreate-session triggers — continuing on a stale window can make a
-// desync permanent. A "too far in future" id is excluded (local clock skew, not
-// a session desync) as is a foreign session_id (potential replay of another
-// session), so neither rotates.
+// msg_id window has diverged from the server's: a msg_id created too far in
+// the past. This is a recreate-session trigger — continuing on a stale window
+// can make a desync permanent. A duplicate / too-low msg_id is NOT a trigger:
+// the server routinely retransmits unacked messages with the same msg_id, the
+// MTProto spec says such messages "are to be ignored", and the official
+// Android client (tgnet) ignores them without rotating the session. A "too
+// far in future" id is excluded too (local clock skew, not a session desync),
+// as is a foreign session_id (potential replay of another session).
 //
 // It also satisfies errors.Is(err, errRejected) so the message itself is still
 // ignored rather than treated as a fatal read error.
@@ -83,7 +85,7 @@ func (c *Conn) decryptMessage(b *bin.Buffer) (*crypto.EncryptedMessageData, erro
 		return nil, errors.Wrapf(err, "bad message id %d", msg.MessageID)
 	}
 	if !c.consumeMessageID(msg.MessageID) {
-		return nil, errors.Wrapf(errStaleMessageID, "duplicate or too low message id %d", msg.MessageID)
+		return nil, errors.Wrapf(errRejected, "duplicate or too low message id %d", msg.MessageID)
 	}
 
 	return msg, nil
