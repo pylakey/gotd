@@ -263,6 +263,15 @@ func (e *Engine) isClosed() bool {
 	return atomic.LoadUint32(&e.closed) == 1
 }
 
+// Pending reports the number of in-flight RPC requests awaiting a response.
+// It is read-only and used by the read watchdog to decide whether a silent
+// connection has outstanding work.
+func (e *Engine) Pending() int {
+	e.mux.Lock()
+	defer e.mux.Unlock()
+	return len(e.rpc)
+}
+
 // Close gracefully closes the engine.
 // All pending requests will be awaited.
 // All Do method calls of closed engine will return ErrEngineClosed error.

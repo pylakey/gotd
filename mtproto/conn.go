@@ -129,6 +129,28 @@ type Conn struct {
 	pfs bool
 	// tempKeyTTL controls requested temporary key lifetime in seconds.
 	tempKeyTTL int
+
+	// readTimeout is the read-silence deadline enforced by the read watchdog.
+	readTimeout time.Duration
+	// watchdogTick is how often the read watchdog checks for silence.
+	watchdogTick time.Duration
+	// lastRecvUnixNano is the clock time of the last successful Recv (or connect),
+	// in unix nanoseconds. It is refreshed on every byte from the server (pongs,
+	// acks, messages) and read by the watchdog to detect read silence.
+	lastRecvUnixNano atomic.Int64
+	// watchdogReady, if non-nil, is closed by the watchdog right after it creates
+	// its ticker. It exists so tests using a mock clock can wait for the ticker to
+	// be registered before advancing time (the mock clock is not safe for
+	// concurrent ticker creation and time travel). Nil and unused in production.
+	watchdogReady chan struct{}
+	// watchdogAborting is set by the watchdog the moment it decides to abort a
+	// dead/half-open socket, before it pushes past read/write deadlines. readLoop
+	// (and any write path) checks it on a transport error: when set, the error is
+	// propagated to unwind the run group deterministically instead of being
+	// retried, so the abort cannot race a fresh Recv that would clear the deadline
+	// and re-wedge.
+	watchdogAborting atomic.Bool
+
 	// Ensure Run once.
 	ran atomic.Bool
 }
@@ -180,6 +202,8 @@ func New(dialer Dialer, opt Options) *Conn {
 		getTimeout:        opt.RequestTimeout,
 		pfs:               opt.EnablePFS,
 		tempKeyTTL:        opt.TempKeyTTL,
+		readTimeout:       opt.ReadTimeout,
+		watchdogTick:      opt.WatchdogTick,
 	}
 	if conn.pfs {
 		// In PFS mode runtime encryption always uses temporary key. Persisted key
@@ -216,6 +240,23 @@ func (c *Conn) handleClose(ctx context.Context) error {
 	<-ctx.Done()
 	c.log.Debug("Closing")
 
+	// Unblock any read/write blocked on a half-open socket BEFORE closing. On a
+	// half-open connection (peer gone, FIN never delivered) Close alone does not
+	// wake a Recv already blocked in a kernel read, so readLoop would stay parked
+	// there forever, the run group's Wait would never return, conn.Run would
+	// never return, and the reconnect loop would never redial. Pushing the read
+	// and write deadlines into the past trips the blocked Recv/Send the same way
+	// the official client force-tears its socket on disconnect. ctx is already
+	// canceled here, so readLoop unwinds via its ctx.Done branch rather than
+	// retrying the timeout.
+	past := c.clock.Now().Add(-time.Second)
+	if err := c.conn.SetReadDeadline(past); err != nil {
+		c.log.Debug("Failed to push read deadline on close", zap.Error(err))
+	}
+	if err := c.conn.SetWriteDeadline(past); err != nil {
+		c.log.Debug("Failed to push write deadline on close", zap.Error(err))
+	}
+
 	// Close RPC Engine.
 	c.rpc.ForceClose()
 	// Close connection.
@@ -245,6 +286,8 @@ func (c *Conn) Run(ctx context.Context, f func(ctx context.Context) error) error
 	if err := c.connect(ctx); err != nil {
 		return errors.Wrap(err, "start")
 	}
+	// Anchor the read-silence deadline at connect; refreshed on every Recv.
+	c.touchLastRecv()
 	{
 		// All goroutines are bound to current call.
 		g := tdsync.NewLogGroup(ctx, c.log.Named("group"))
@@ -269,6 +312,7 @@ func (c *Conn) Run(ctx context.Context, f func(ctx context.Context) error) error
 			// Renewal loop requests reconnect before temp key expiry.
 			g.Go("tempKeyRenewal", c.tempKeyRenewalLoop)
 		}
+		g.Go("readWatchdog", c.readWatchdog)
 		g.Go("userCallback", f)
 
 		if err := g.Wait(); err != nil {

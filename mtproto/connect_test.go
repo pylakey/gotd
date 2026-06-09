@@ -6,6 +6,7 @@ import (
 	"io"
 	"testing"
 	"testing/iotest"
+	"time"
 
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
@@ -26,6 +27,14 @@ func (c *closeConn) Send(ctx context.Context, b *bin.Buffer) error {
 
 func (c *closeConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	return io.EOF
+}
+
+func (c *closeConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *closeConn) SetWriteDeadline(t time.Time) error {
+	return nil
 }
 
 func (c *closeConn) Close() error {

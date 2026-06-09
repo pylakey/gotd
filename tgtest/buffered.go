@@ -3,6 +3,7 @@ package tgtest
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/transport"
@@ -56,6 +57,14 @@ func (c *bufferedConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	}
 
 	return c.conn.Recv(ctx, b)
+}
+
+func (c *bufferedConn) SetReadDeadline(t time.Time) error {
+	return c.conn.SetReadDeadline(t)
+}
+
+func (c *bufferedConn) SetWriteDeadline(t time.Time) error {
+	return c.conn.SetWriteDeadline(t)
 }
 
 func (c *bufferedConn) Close() error {

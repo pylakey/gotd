@@ -61,6 +61,20 @@ type Options struct {
 	PingDisconnectDelay time.Duration
 	// RequestTimeout is function which returns request timeout for given type ID.
 	RequestTimeout func(req uint32) time.Duration
+	// ReadTimeout is the read-silence deadline used by the read watchdog. If the
+	// connection receives no bytes from the server for this duration while it has
+	// pending work (an in-flight RPC or it is not yet ready), the watchdog aborts
+	// the blocked read so conn.Run returns and the connection is recreated. It is
+	// the backstop for a half-open / blackholed socket where the ping write
+	// succeeds into a dead TCP buffer but no pong returns.
+	//
+	// It must be larger than PingInterval so the keepalive pongs (which refresh
+	// the read deadline) do not trip it on a healthy connection; the default is
+	// derived from the ping cadence. Defaults to ~35s.
+	ReadTimeout time.Duration
+	// WatchdogTick is how often the read watchdog checks for silence. Defaults to
+	// 1s, matching the official client's connection select() cadence.
+	WatchdogTick time.Duration
 
 	// CompressThreshold is a threshold in bytes to determine that message
 	// is large enough to be compressed using GZIP.
@@ -176,6 +190,16 @@ func (opt *Options) setDefaults() {
 		opt.RequestTimeout = func(req uint32) time.Duration {
 			return 15 * time.Second
 		}
+	}
+	if opt.WatchdogTick == 0 {
+		opt.WatchdogTick = 1 * time.Second
+	}
+	if opt.ReadTimeout == 0 {
+		// Couple to the ping cadence so a single missed pong does not trip the
+		// watchdog but a genuinely blackholed socket (no pongs at all) does. The
+		// keepalive pings every PingInterval generate pong traffic that refreshes
+		// the read deadline; the timeout must sit safely above that cadence.
+		opt.ReadTimeout = max(2*opt.PingInterval, opt.PingInterval+opt.PingTimeout)
 	}
 	if opt.CompressThreshold == 0 {
 		opt.CompressThreshold = 1024

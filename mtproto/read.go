@@ -213,6 +213,22 @@ func (c *Conn) readLoop(ctx context.Context) (err error) {
 		}
 
 		if err := c.conn.Recv(ctx, buf); err != nil {
+			// The watchdog has decided to abort a dead/half-open socket and
+			// pushed a past read deadline; this is the error from that. Propagate
+			// it to unwind the run group deterministically. Without this, the
+			// noUpdates->continue path below would issue a fresh Recv that resets
+			// the read deadline (transport.connection.Recv clears it at the top of
+			// every call) and re-wedges before the watchdog's returned error can
+			// cancel ctx — only a single-shot abort would not break a half-open
+			// socket where Close does not unblock the read.
+			if c.watchdogAborting.Load() {
+				// Surface ErrReadTimeout (wrapping the transport error for
+				// context) so conn.Run's caller sees the same sentinel whether the
+				// group reports the watchdog's return or this readLoop unwind
+				// first — the two race and either may win.
+				return errors.Wrap(ErrReadTimeout, "read watchdog abort: "+err.Error())
+			}
+
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
@@ -238,6 +254,10 @@ func (c *Conn) readLoop(ctx context.Context) (err error) {
 				return errors.Wrap(err, "read")
 			}
 		}
+
+		// Refresh the read-silence deadline: any byte from the server (pong, ack,
+		// message) proves the socket is alive and resets the watchdog.
+		c.touchLastRecv()
 
 		handlers.Add(1)
 		go func() {

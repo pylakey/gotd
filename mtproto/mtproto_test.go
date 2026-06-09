@@ -3,6 +3,7 @@ package mtproto
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/go-faster/errors"
 
@@ -52,6 +53,14 @@ func (c *constantConn) Recv(ctx context.Context, b *bin.Buffer) error {
 	c.mux.Unlock()
 
 	b.Put(c.data)
+	return nil
+}
+
+func (c *constantConn) SetReadDeadline(t time.Time) error {
+	return nil
+}
+
+func (c *constantConn) SetWriteDeadline(t time.Time) error {
 	return nil
 }
 
