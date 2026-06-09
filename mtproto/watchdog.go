@@ -13,10 +13,47 @@ import (
 // work. It unwinds conn.Run so the connection is recreated.
 var ErrReadTimeout = errors.New("read timeout: connection silent with pending work")
 
+// ErrConnDead wraps a write that failed because the underlying socket is dead
+// (broken pipe / connection reset). The write path also tears the connection
+// down via abortDeadSocket; this sentinel lets layers above the connection
+// recognise the originating request's failure as a transient transport death —
+// so a store-and-resend layer can replay THAT request on the reconnected conn,
+// the same way concurrent in-flight requests recover via the engine force-close.
+var ErrConnDead = errors.New("connection dead")
+
 // touchLastRecv refreshes the read-silence deadline to the current clock time.
 // Called on connect and on every successful Recv.
 func (c *Conn) touchLastRecv() {
 	c.lastRecvUnixNano.Store(c.clock.Now().UnixNano())
+}
+
+// abortDeadSocket force-tears a dead / half-open socket so readLoop unwinds and
+// conn.Run returns, letting the reconnect loop redial in place. It is the Go
+// realization of how the official Telegram client tears its socket down on ANY
+// socket error — read OR write — rather than letting a dead connection limp:
+//
+//  1. Set watchdogAborting FIRST. readLoop checks it on a transport error and
+//     unwinds instead of retrying, so the abort cannot race a fresh Recv that
+//     would clear the deadline (transport.connection.Recv resets it at the top of
+//     every call) and re-wedge a half-open socket forever.
+//  2. Push past read AND write deadlines: a past read deadline trips a Recv
+//     blocked where Close may not unblock it (half-open: the peer's FIN never
+//     arrives); a past write deadline trips a Send blocked on a full kernel
+//     buffer.
+//
+// Idempotent: if a teardown is already in progress (the read watchdog and a
+// failing write can race) the second caller is a no-op.
+func (c *Conn) abortDeadSocket() {
+	if c.watchdogAborting.Swap(true) {
+		return
+	}
+	past := c.clock.Now().Add(-time.Second)
+	if err := c.conn.SetReadDeadline(past); err != nil {
+		c.log.Debug("abort dead socket: set read deadline failed", zap.Error(err))
+	}
+	if err := c.conn.SetWriteDeadline(past); err != nil {
+		c.log.Debug("abort dead socket: set write deadline failed", zap.Error(err))
+	}
 }
 
 // hasPendingWork reports whether the connection has outstanding work that a
@@ -82,26 +119,13 @@ func (c *Conn) readWatchdog(ctx context.Context) error {
 			// Silent with pending work: the socket is dead. Abort
 			// deterministically.
 			//
-			// 1. Set the aborting flag FIRST. readLoop (and any write path)
-			//    checks it on a transport error and unwinds instead of retrying,
-			//    so the abort cannot race a fresh Recv that would reset the
-			//    deadline (transport.connection.Recv clears it at the top of every
-			//    call) and re-wedge a half-open socket forever.
-			// 2. Push past read AND write deadlines: a past read deadline trips a
-			//    blocked Recv where Close may not on a half-open socket; a past
-			//    write deadline trips a Send blocked on a full kernel buffer.
-			// 3. Return ErrReadTimeout to unwind the run group.
+			// abortDeadSocket sets the aborting flag and pushes past read+write
+			// deadlines (see its doc); then return ErrReadTimeout to unwind the run
+			// group.
 			c.log.Warn("read watchdog: silence with pending work, forcing reconnect",
 				zap.Duration("read_timeout", c.readTimeout),
 			)
-			c.watchdogAborting.Store(true)
-			past := now.Add(-time.Second)
-			if err := c.conn.SetReadDeadline(past); err != nil {
-				c.log.Debug("read watchdog: set read deadline failed", zap.Error(err))
-			}
-			if err := c.conn.SetWriteDeadline(past); err != nil {
-				c.log.Debug("read watchdog: set write deadline failed", zap.Error(err))
-			}
+			c.abortDeadSocket()
 			return errors.Wrap(ErrReadTimeout, "read watchdog")
 		}
 	}

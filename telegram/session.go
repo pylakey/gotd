@@ -132,6 +132,11 @@ func (c *Client) onSession(cfg tg.Config, s mtproto.Session) error {
 	c.onReady()
 	c.connMux.Unlock()
 
+	// Store-and-resend: the new conn is installed and ready, so re-issue any
+	// in-flight requests parked by a transport drop on the previous conn. Done
+	// after connMux.Unlock so replay RPCs do not run under connMux.
+	c.replayLiveRequests()
+
 	if err := c.saveSession(cfg, s); err != nil {
 		return errors.Wrap(err, "save")
 	}

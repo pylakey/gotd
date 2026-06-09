@@ -97,6 +97,12 @@ type Client struct {
 	connBackoff atomic.Pointer[backoff.BackOff]
 	connMux     sync.Mutex
 
+	// requests is the durable in-flight request registry (the official client's
+	// runningRequests). It lives above the swappable conn so replayable entries
+	// survive a transport drop and are re-issued on the new conn. Set once in
+	// init() and never reassigned; it has its OWN mutex, not connMux.
+	requests *requestRegistry
+
 	// Restart signal channel.
 	restart chan struct{} // immutable
 
@@ -282,6 +288,11 @@ func (c *Client) init() {
 	c.cdnKeysSet = false
 	c.cdnKeysGen = 0
 	c.cdnKeysLoad = singleflight.Group{}
+	// Store-and-resend: install the request registry as the INNERMOST middleware
+	// (last in c.mw wraps invokeDirect first), so it sits directly above the
+	// swappable conn and the resend is invisible to user middlewares above it.
+	c.requests = newRequestRegistry()
+	c.mw = append(c.mw, c.requests.middleware(c))
 	c.invoker = chainMiddlewares(InvokeFunc(c.invokeDirect), c.mw...)
 	c.tg = tg.NewClient(c.invoker)
 }

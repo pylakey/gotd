@@ -123,7 +123,16 @@ func (c *Conn) consumeMessage(ctx context.Context, buf *bin.Buffer) error {
 	if err := c.handleMessage(msg.MessageID, &bin.Buffer{Buf: msg.Data()}); err != nil {
 		// Probably we can return here, but this will shutdown whole
 		// connection which can be unexpected.
-		c.log.Warn("Error while handling message", zap.Error(err))
+		//
+		// A context.Canceled here is just teardown: the conn/handler ctx was
+		// canceled while already-decoded messages were still draining. That is
+		// not a failure, and on a busy account a single graceful stop can drain
+		// hundreds of in-flight updates — logging each at warn floods the logs.
+		if errors.Is(err, context.Canceled) {
+			c.log.Debug("Stopped handling message: context canceled", zap.Error(err))
+		} else {
+			c.log.Warn("Error while handling message", zap.Error(err))
+		}
 		// Sending acknowledge even on error. Client should restore
 		// from missing updates via explicit pts check and getDiff call.
 	}
@@ -236,8 +245,9 @@ func (c *Conn) readLoop(ctx context.Context) (err error) {
 		}
 
 		if err := c.conn.Recv(ctx, buf); err != nil {
-			// The watchdog has decided to abort a dead/half-open socket and
-			// pushed a past read deadline; this is the error from that. Propagate
+			// The read watchdog OR a failed write (via abortDeadSocket) has decided
+			// to tear down a dead/half-open socket and pushed a past read deadline;
+			// this is the error from that. Propagate
 			// it to unwind the run group deterministically. Without this, the
 			// noUpdates->continue path below would issue a fresh Recv that resets
 			// the read deadline (transport.connection.Recv clears it at the top of
@@ -249,7 +259,7 @@ func (c *Conn) readLoop(ctx context.Context) (err error) {
 				// context) so conn.Run's caller sees the same sentinel whether the
 				// group reports the watchdog's return or this readLoop unwind
 				// first — the two race and either may win.
-				return errors.Wrap(ErrReadTimeout, "read watchdog abort: "+err.Error())
+				return errors.Wrap(ErrReadTimeout, "transport abort: "+err.Error())
 			}
 
 			select {
@@ -293,7 +303,14 @@ func (c *Conn) readLoop(ctx context.Context) (err error) {
 			// overhead, especially on multi-CPU systems with multiple running
 			// clients.
 			if err := c.consumeMessage(ctx, buf); err != nil {
-				log.Error("Failed to process message", zap.Error(err))
+				// context.Canceled is teardown (the ack-send was aborted because
+				// the conn ctx was canceled), not a processing failure — keep it
+				// at debug so a graceful stop does not flood error logs.
+				if errors.Is(err, context.Canceled) {
+					log.Debug("Stopped processing message: context canceled", zap.Error(err))
+				} else {
+					log.Error("Failed to process message", zap.Error(err))
+				}
 				lastErr.Store(errors.Wrap(err, "consume"))
 			}
 		}()

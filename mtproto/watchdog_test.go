@@ -6,6 +6,8 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -667,6 +669,197 @@ func TestReadLoop_TeardownDoesNotWaitOnStuckHandler(t *testing.T) {
 		// GREEN: conn.Run unwound despite the parked handler.
 	case <-time.After(5 * time.Second):
 		a.Fail("conn.Run wedged: readLoop blocked on a stuck update handler at teardown")
+	}
+}
+
+// writeDeathConn models a socket that has died on the WRITE side while readLoop
+// is parked in Recv with no incoming bytes: the next Send returns a broken-pipe
+// net error (exactly what a real net.Conn returns after the peer reset the
+// connection), and Recv behaves like a half-open socket (resets its deadline at
+// the top of every call, trips only when a past deadline lands on an in-flight
+// Recv, never woken by Close). This reproduces the production case the user
+// reported: an RPC write hits EPIPE on a dead socket that nothing else has torn
+// down yet — the ping keepalive still thinks the conn is alive, so without a
+// write-side teardown the dead socket limps until the much slower pong-miss.
+type writeDeathConn struct {
+	*halfOpenConn // Recv / SetReadDeadline / Close behavior of a half-open socket.
+}
+
+func (c *writeDeathConn) Send(context.Context, *bin.Buffer) error {
+	return &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+}
+
+var _ transport.Conn = (*writeDeathConn)(nil)
+
+// newRealEngineConn is like newWatchdogConn but wires the REAL rpc engine
+// (Conn.writeContentMessage), so an Invoke exercises the production write path
+// (Conn.write -> transport.Send) instead of a black-holed send. The write-side
+// death test must drive a real transport write to observe the teardown.
+func newRealEngineConn(tb testing.TB, tr transport.Conn, c clock.Clock) *Conn {
+	opt := Options{
+		Clock:     c,
+		Random:    rand.Reader,
+		Logger:    zaptest.NewLogger(tb),
+		Key:       crypto.Key{}.WithID(),
+		SessionID: 1, // non-zero -> connect skips key exchange.
+		MessageID: proto.NewMessageIDGen(c.Now),
+		// Push ping/ack/salt far out so the ONLY teardown trigger under test is
+		// the write-side death.
+		PingInterval:      time.Hour,
+		PingTimeout:       time.Hour,
+		AckInterval:       time.Hour,
+		SaltFetchInterval: time.Hour,
+		ReadTimeout:       200 * time.Millisecond,
+		WatchdogTick:      5 * time.Millisecond,
+		// engine left nil: New wires the real Conn.writeContentMessage.
+	}
+	conn := New(func(context.Context) (transport.Conn, error) {
+		return tr, nil
+	}, opt)
+	conn.messageIDBuf = noopBuf{}
+	// Leave gotSession UNSIGNALED so saltLoop blocks on it and never performs its
+	// initial getSalts write. That initial salt write would otherwise hit the dead
+	// socket and unwind the group via saltLoop's own error return (an EXISTING
+	// teardown path), masking the gap under test: the RPC write path returns its
+	// error to the caller, not to a run-group loop. In production salts are fetched
+	// once then hourly, so a socket dying mid-session is exactly the case where no
+	// service loop writes — only the RPC path does.
+	conn.gotSession = tdsync.NewReady()
+	return conn
+}
+
+// TestConnRun_WriteDeathForcesReconnect asserts that a write-side transport error
+// (broken pipe) tears the connection down promptly — the same way the official
+// Telegram client reconnects on ANY socket error — instead of failing only the
+// caller and leaving the dead socket to limp until the much slower pong-miss /
+// read watchdog. The ping keepalive and the read watchdog are both disabled, so
+// the ONLY thing that can unwind conn.Run is the write-death teardown.
+//
+// RED before the write-side abort fix (conn.Run wedges: the write error returns
+// to the caller but the run group never unwinds). GREEN after.
+func TestConnRun_WriteDeathForcesReconnect(t *testing.T) {
+	a := require.New(t)
+
+	c := neo.NewTime(time.Now())
+	wd := &writeDeathConn{halfOpenConn: newHalfOpenConn()}
+	conn := newRealEngineConn(t, wd, c)
+	conn.readTimeout = 0 // watchdog off: prove the write path tears the conn down.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- conn.Run(ctx, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+
+	// Wait until readLoop is blocked in Recv on the (silent) half-open socket.
+	waitFor(t, func() bool { return wd.recvCalls() > 0 })
+
+	// Fire an RPC: its write hits the dead socket (broken pipe). With the fix this
+	// tears the conn down so conn.Run returns; without it the error returns only
+	// to this caller and the dead socket keeps limping.
+	invokeDone := make(chan struct{})
+	go func() {
+		defer close(invokeDone)
+		_ = conn.Invoke(ctx, testPayload{Data: []byte{1}}, testPayload{})
+	}()
+
+	select {
+	case err := <-runErr:
+		a.Error(err)
+	case <-time.After(5 * time.Second):
+		a.Fail("conn.Run wedged: write-side death did not force a reconnect")
+	}
+
+	// Drain the in-flight RPC goroutine so it cannot log after the test returns.
+	cancel()
+	select {
+	case <-invokeDone:
+	case <-time.After(5 * time.Second):
+		a.Fail("in-flight Invoke did not return after Run exit")
+	}
+}
+
+// writeDeathNetConn is a net.Conn whose Write starts working (so the transport
+// handshake succeeds) and then, once armed, returns a broken-pipe error on every
+// Write — exactly like a real socket whose peer reset the connection mid-session.
+// Reads block like a half-open socket (delegating to halfOpenNetConn) until the
+// read deadline is pushed into the past. Wrapped in a REAL transport.connection
+// it exercises the production write path — connection.Send setting the write
+// deadline, codec framing, and the abort's connection.SetReadDeadline ->
+// net.Conn.SetReadDeadline tripping the real codec read — that the transport-level
+// writeDeathConn mock bypasses.
+type writeDeathNetConn struct {
+	*halfOpenNetConn
+	failWrites atomic.Bool
+}
+
+func (c *writeDeathNetConn) Write(b []byte) (int, error) {
+	if c.failWrites.Load() {
+		return 0, &net.OpError{Op: "write", Net: "tcp", Err: syscall.EPIPE}
+	}
+	return c.halfOpenNetConn.Write(b)
+}
+
+var _ net.Conn = (*writeDeathNetConn)(nil)
+
+// TestConnRun_WriteDeathThroughRealTransport is the production-faithful companion
+// to TestConnRun_WriteDeathForcesReconnect: the write that hits the broken pipe
+// travels through a REAL transport.connection (intermediate codec) and the
+// teardown must unblock the real codec read via connection.SetReadDeadline ->
+// net.Conn.SetReadDeadline. If the write-side abort only worked against the
+// transport-level mock this would wedge; with the real layer it must still return.
+//
+// RED before the write-side abort fix; GREEN after.
+func TestConnRun_WriteDeathThroughRealTransport(t *testing.T) {
+	a := require.New(t)
+
+	netc := &writeDeathNetConn{halfOpenNetConn: newHalfOpenNetConn()}
+	tr, err := transport.Intermediate.Handshake(netc) // handshake writes succeed.
+	a.NoError(err)
+
+	c := neo.NewTime(time.Now())
+	conn := newRealEngineConn(t, tr, c)
+	conn.readTimeout = 0 // watchdog off: isolate the write-death teardown path.
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- conn.Run(ctx, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+
+	// Give readLoop time to block in the real codec read, then arm write failures.
+	time.Sleep(50 * time.Millisecond)
+	netc.failWrites.Store(true)
+
+	// Fire an RPC: its write now hits the broken pipe through the real codec.
+	invokeDone := make(chan struct{})
+	go func() {
+		defer close(invokeDone)
+		_ = conn.Invoke(ctx, testPayload{Data: []byte{1}}, testPayload{})
+	}()
+
+	select {
+	case err := <-runErr:
+		a.Error(err)
+	case <-time.After(5 * time.Second):
+		a.Fail("conn.Run wedged through real transport.connection: write-side death did not force a reconnect")
+	}
+
+	cancel()
+	select {
+	case <-invokeDone:
+	case <-time.After(5 * time.Second):
+		a.Fail("in-flight Invoke did not return after Run exit")
 	}
 }
 

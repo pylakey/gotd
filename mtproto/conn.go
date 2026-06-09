@@ -143,12 +143,12 @@ type Conn struct {
 	// be registered before advancing time (the mock clock is not safe for
 	// concurrent ticker creation and time travel). Nil and unused in production.
 	watchdogReady chan struct{}
-	// watchdogAborting is set by the watchdog the moment it decides to abort a
-	// dead/half-open socket, before it pushes past read/write deadlines. readLoop
-	// (and any write path) checks it on a transport error: when set, the error is
-	// propagated to unwind the run group deterministically instead of being
-	// retried, so the abort cannot race a fresh Recv that would clear the deadline
-	// and re-wedge.
+	// watchdogAborting is set (via abortDeadSocket) the moment the read watchdog OR
+	// a failed write decides to tear down a dead/half-open socket, before pushing
+	// past read/write deadlines. readLoop checks it on a transport error: when set,
+	// the error is propagated to unwind the run group deterministically instead of
+	// being retried, so the abort cannot race a fresh Recv that would clear the
+	// deadline and re-wedge.
 	watchdogAborting atomic.Bool
 
 	// Ensure Run once.

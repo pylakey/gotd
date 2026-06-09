@@ -3,6 +3,8 @@ package mtproto
 import (
 	"context"
 
+	"github.com/go-faster/errors"
+
 	"github.com/gotd/td/bin"
 )
 
@@ -31,6 +33,27 @@ func (c *Conn) write(ctx context.Context, msgID int64, seqNo int32, message bin.
 	}
 
 	if err := c.conn.Send(ctx, b); err != nil {
+		// A transport write failure means the socket is dead. The official Telegram
+		// client reconnects on ANY socket error — a failed write tears the socket
+		// down exactly like a failed read — instead of failing the request against a
+		// dead connection. Mirror that: promote a real write error to a connection
+		// teardown so conn.Run returns and the reconnect loop redials in place,
+		// rather than letting the dead socket limp until the much slower pong-miss /
+		// read watchdog while subsequent writes pile up broken-pipe errors. All
+		// writes funnel through here (rpc engine, ping, ack, salt), so this is the
+		// single point that turns any write-side death into a reconnect.
+		//
+		// A ctx-cancelled write is the caller's own cancellation (or our deadline
+		// push during an in-progress teardown), NOT a transport death — never tear
+		// the shared connection down for that.
+		if ctx.Err() == nil {
+			c.abortDeadSocket()
+			// Surface a recognisable transport-death sentinel (not the bare net
+			// error) so the store-and-resend layer above the connection can replay
+			// THIS request — the one whose write hit the dead socket — on the
+			// reconnected conn, instead of failing it with a broken-pipe error.
+			return errors.Wrap(ErrConnDead, err.Error())
+		}
 		return err
 	}
 
