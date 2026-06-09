@@ -245,11 +245,14 @@ func (c *Conn) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder
 		err := c.invokeCDN(ctx, input, output)
 		return err
 	}
-	q := c.wrapRequest(noopDecoder{input})
-	req := c.wrapRequest(&tg.InvokeWithLayerRequest{
-		Layer: tg.Layer,
-		Query: q,
-	})
+	// Match the official Telegram Android client: invokeWithLayer is the carrier
+	// of initConnection and the two are sent as one nested unit only while init
+	// is needed for this DC's auth-key. init() already negotiated the layer for
+	// this connection's (persisted, per-auth-key) init state, so once inited the
+	// request goes on the wire as the BARE TL method — no invokeWithLayer, no
+	// initConnection. wrapRequest still applies the orthogonal invokeWithoutUpdates
+	// wrapper in ConnModeData; that is independent of the layer wrapper.
+	req := c.wrapRequest(noopDecoder{input})
 	err := c.proto.Invoke(ctx, req, output)
 	return err
 }
@@ -370,8 +373,8 @@ func (c *Conn) init(ctx context.Context) error {
 	version := c.initVersion()
 	// Skip the full initConnection if this DC already accepted the same init
 	// version (Android-style cached init version). The connection still refreshes
-	// config via a bare invokeWithLayer(help.getConfig) so it becomes ready
-	// (gotConfig must signal regardless of the skip).
+	// config via a bare help.getConfig so it becomes ready (gotConfig must signal
+	// regardless of the skip).
 	skipInit := c.initCache.Done(c.dc, version)
 
 	if skipInit {
@@ -391,7 +394,7 @@ func (c *Conn) init(ctx context.Context) error {
 				return errors.Wrap(err, "flood wait")
 			}
 			// On the skip path the server may reject the bare
-			// invokeWithLayer(getConfig) when its init state (bound to the
+			// help.getConfig when its init state (bound to the
 			// auth_key) diverged from our cache — e.g. a restored session whose
 			// key was rotated server-side. Bust the stale cache entry and retry
 			// once with the full initConnection in the same init() call, mirroring
@@ -442,14 +445,13 @@ func (c *Conn) init(ctx context.Context) error {
 }
 
 // initRequest builds the init() invoke. When skip is true it sends a bare
-// invokeWithLayer(getConfig) (relying on the server-side cached init state);
-// otherwise it sends the full invokeWithLayer(initConnection(getConfig)).
+// help.getConfig (relying on the server-side cached, per-auth-key init state),
+// matching how the official Telegram Android client issues bare requests once a
+// DC's auth-key is inited; otherwise it sends the full
+// invokeWithLayer(initConnection(getConfig)).
 func (c *Conn) initRequest(skip bool) bin.Object {
 	if skip {
-		return c.wrapRequest(&tg.InvokeWithLayerRequest{
-			Layer: tg.Layer,
-			Query: c.wrapRequest(&tg.HelpGetConfigRequest{}),
-		})
+		return c.wrapRequest(&tg.HelpGetConfigRequest{})
 	}
 	q := c.wrapRequest(&tg.InitConnectionRequest{
 		APIID:          c.appID,

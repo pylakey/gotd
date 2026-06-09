@@ -279,18 +279,14 @@ func TestConnInvokeDataKeepsInvokeWithoutUpdates(t *testing.T) {
 
 	a.NoError(c.Invoke(context.Background(), &tg.HelpGetConfigRequest{}, &tg.Config{}))
 
+	// Once inited, ConnModeData sends invokeWithoutUpdates(method) — the
+	// orthogonal invokeWithoutUpdates wrapper is preserved, but there is no
+	// invokeWithLayer (Android wrapInLayer: bare once inited).
 	outer, ok := p.lastInput.(*tg.InvokeWithoutUpdatesRequest)
 	a.True(ok)
 
-	withLayer, ok := outer.Query.(*tg.InvokeWithLayerRequest)
-	a.True(ok)
-	a.Equal(tg.Layer, withLayer.Layer)
-
-	inner, ok := withLayer.Query.(*tg.InvokeWithoutUpdatesRequest)
-	a.True(ok)
-
-	query, ok := inner.Query.(noopDecoder)
-	a.True(ok)
+	query, ok := outer.Query.(noopDecoder)
+	a.True(ok, "invokeWithoutUpdates must carry the bare method, not invokeWithLayer")
 	_, ok = query.Encoder.(*tg.HelpGetConfigRequest)
 	a.True(ok)
 }
