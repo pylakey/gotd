@@ -32,6 +32,10 @@ func (s *Server) rpcHandle(ctx context.Context, c transport.Conn, b *bin.Buffer)
 		return errors.Wrap(err, "decrypt message")
 	}
 
+	if s.onSeqNo != nil {
+		s.onSeqNo(msg.SessionID, msg.MessageID, msg.SeqNo)
+	}
+
 	session := Session{
 		ID:      msg.SessionID,
 		AuthKey: key,
@@ -79,6 +83,10 @@ func (s *Server) handle(req *Request) error {
 		pingReq := mt.PingDelayDisconnectRequest{}
 		if err := pingReq.Decode(in); err != nil {
 			return err
+		}
+
+		if s.onPing != nil {
+			s.onPing(req, pingReq.DisconnectDelay)
 		}
 
 		return s.SendPong(req, pingReq.PingID)
@@ -130,6 +138,10 @@ func (s *Server) handle(req *Request) error {
 			}))
 		}
 		return err
+	}
+
+	if s.onRequest != nil {
+		s.onRequest(req)
 	}
 
 	if err := s.handler.OnMessage(s, req); err != nil {

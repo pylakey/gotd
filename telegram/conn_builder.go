@@ -2,6 +2,7 @@ package telegram
 
 import (
 	"context"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -13,6 +14,37 @@ import (
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/transport"
 )
+
+// Per-connection-type connect timeouts matching the official Telegram Android
+// client. gotd has only three ConnModes, so we map the generic/updates connection to the
+// Android "generic" timeout (12s) and data/CDN (download/upload) connections to
+// the Android "upload" timeout (25s). Push/proxy Android types have no gotd analog.
+const (
+	dialTimeoutGeneric = 12 * time.Second
+	dialTimeoutData    = 25 * time.Second
+)
+
+// dialTimeoutForMode returns the Android-parity connect timeout for a connection
+// mode. It is only used when the caller did not set an explicit DialTimeout.
+func dialTimeoutForMode(mode manager.ConnMode) time.Duration {
+	switch mode {
+	case manager.ConnModeData, manager.ConnModeCDN:
+		return dialTimeoutData
+	default: // ConnModeUpdates — generic/primary connection.
+		return dialTimeoutGeneric
+	}
+}
+
+// applyConnDefaults wires the Android per-connection-type dial timeout into opts
+// unless the caller set an explicit DialTimeout on the client options (which
+// takes precedence). Shared by every connection-creation path (primary
+// createConn and the data/CDN/media pools via newPoolConn) so the wiring cannot
+// drift between them.
+func (c *Client) applyConnDefaults(opts *mtproto.Options, mode manager.ConnMode) {
+	if c.opts.DialTimeout == 0 {
+		opts.DialTimeout = dialTimeoutForMode(mode)
+	}
+}
 
 type clientHandler struct {
 	client *Client
@@ -102,16 +134,18 @@ func (c *Client) createConn(
 		zap.Int64("conn_id", id),
 		zap.Int("dc_id", s.DC),
 	)
+	c.applyConnDefaults(&opts, mode)
 
 	return c.create(
 		c.primaryDC(s.DC), mode, c.appID,
 		opts, manager.ConnOptions{
-			DC:      s.DC,
-			Test:    c.testDC,
-			Device:  c.device,
-			Handler: c.asHandler(),
-			Setup:   setup,
-			OnDead:  onDead,
+			DC:        s.DC,
+			Test:      c.testDC,
+			Device:    c.device,
+			Handler:   c.asHandler(),
+			Setup:     setup,
+			OnDead:    onDead,
+			InitCache: c.initVersions,
 		},
 	)
 }

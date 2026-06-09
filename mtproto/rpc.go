@@ -41,6 +41,21 @@ func (c *Conn) Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder
 			c.log.Info("Retrying request after basMsgErr", zap.Int64("msg_id", req.MsgID))
 			return c.rpc.Do(ctx, req)
 		}
+		if errors.As(err, &badMsgErr) && isTimeOffsetCode(badMsgErr.Code) {
+			// handleBadMsg already re-learned the server-time offset (and rotated
+			// the session if the correction was downward). Retry with a fresh
+			// msg_id/seqno so the request is re-stamped under the corrected clock
+			// and current session, instead of hard-failing.
+			retryMsgID, retrySeqNo := c.nextMsgSeq(true)
+			c.log.Info("Retrying request after server-time offset correction",
+				zap.Int("error_code", badMsgErr.Code),
+				zap.Int64("old_msg_id", req.MsgID),
+				zap.Int64("new_msg_id", retryMsgID),
+			)
+			req.MsgID = retryMsgID
+			req.SeqNo = retrySeqNo
+			return c.rpc.Do(ctx, req)
+		}
 		return errors.Wrap(err, "rpcDoRequest")
 	}
 

@@ -282,6 +282,9 @@ Loop:
 				AuthKey:    crypto.AuthKey{Value: key, ID: authKeyID},
 				SessionID:  sessionID,
 				ServerSalt: serverSalt,
+				// server_time is the server clock at handshake; surface it so the
+				// connection can seed its persistent server-time offset.
+				ServerTime: int64(innerData.ServerTime),
 			}
 			if c.mode == ExchangeModeTemporary {
 				// Telegram does not return absolute expiry timestamp here, so we

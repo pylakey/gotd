@@ -54,6 +54,11 @@ type Options struct {
 	PingTimeout time.Duration
 	// PingInterval is duration between ping_delay_disconnect request.
 	PingInterval time.Duration
+	// PingDisconnectDelay is the disconnect_delay announced to the server in
+	// ping_delay_disconnect. Telegram Android decouples this from the ping
+	// cadence (generic: ping 19s, disconnect_delay 35s). If zero, it falls back
+	// to PingInterval+PingTimeout for backward compatibility.
+	PingDisconnectDelay time.Duration
 	// RequestTimeout is function which returns request timeout for given type ID.
 	RequestTimeout func(req uint32) time.Duration
 
@@ -75,6 +80,21 @@ type Options struct {
 	PermKey crypto.AuthKey
 	// Salt from server that can be used to restore previous connection.
 	Salt int64
+	// SessionID, if non-zero, restores the MTProto session_id of a previous
+	// connection so a plain reconnect to the same DC continues that session
+	// (no new key exchange, seqno continued) instead of starting a fresh one.
+	SessionID int64
+	// SeqNo restores the content-message sequence counter
+	// (sentContentMessages) of a previous connection. Only meaningful together
+	// with a non-zero SessionID.
+	SeqNo int32
+	// TimeOffset is the persistent server-time offset store (server - local, in
+	// seconds), mirroring the official client's timeDifference. It is owned above
+	// the per-reconnect Conn so an offset learned/corrected on one connection is
+	// applied to every msg_id and inbound id-bounds check on the next. If nil, a
+	// fresh zero offset is created. The Conn both reads it (msg_id, bounds) and
+	// updates it (handshake ServerTime, new_session_created, bad_msg 16/17).
+	TimeOffset *ServerTimeOffset
 
 	// EnablePFS enables Perfect Forward Secrecy using temporary auth keys.
 	EnablePFS bool
@@ -163,8 +183,15 @@ func (opt *Options) setDefaults() {
 	if opt.Clock == nil {
 		opt.Clock = clock.System
 	}
+	if opt.TimeOffset == nil {
+		opt.TimeOffset = NewServerTimeOffset(0)
+	}
 	if opt.MessageID == nil {
-		opt.MessageID = proto.NewMessageIDGen(opt.Clock.Now)
+		// msg_id is derived from the server clock (local + persistent offset) so
+		// it stays inside the server's accept window across clock skew. Shares
+		// the offset store with the inbound id-bounds checks.
+		sc := newServerClock(opt.Clock, opt.TimeOffset)
+		opt.MessageID = proto.NewMessageIDGen(sc.Now)
 	}
 	if opt.TempKeyTTL == 0 {
 		opt.TempKeyTTL = defaultTempKeyTTL

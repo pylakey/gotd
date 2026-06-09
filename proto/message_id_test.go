@@ -73,6 +73,37 @@ func TestMessageIDGen(t *testing.T) {
 	}
 }
 
+// TestMessageIDGen_Reset verifies that Reset drops the monotonic high-water
+// mark so that, after the backing clock is moved earlier (e.g. a downward
+// server-time correction), the next generated id tracks the lower clock instead
+// of staying pinned just above the previous high-water mark.
+func TestMessageIDGen_Reset(t *testing.T) {
+	date := testutil.Date()
+	clk := neo.NewTime(date)
+
+	gen := NewMessageIDGen(clk.Now)
+
+	// Advance the clock far forward and generate an id, bumping the high-water
+	// mark to ~date+1h.
+	clk.Travel(time.Hour)
+	high := MessageID(gen.New(MessageFromClient))
+	require.InDelta(t, clk.Now().Unix(), high.Time().Unix(), 1)
+
+	// Now the "server clock" is corrected downward: move the backing clock back
+	// to the original instant.
+	clk.Travel(-time.Hour)
+
+	// Without Reset the generator would keep emitting ids ~ date+1h (only +10ns
+	// per call) because g.nano still holds the old high-water mark.
+	gen.Reset()
+
+	got := MessageID(gen.New(MessageFromClient))
+	require.InDelta(t, clk.Now().Unix(), got.Time().Unix(), 1,
+		"after Reset the generated id must track the corrected (lower) clock")
+	require.Less(t, int64(got), int64(high),
+		"after a downward reset the next id must be lower than the previous high-water id")
+}
+
 func BenchmarkMsgIDGen_New(b *testing.B) {
 	b.ReportAllocs()
 

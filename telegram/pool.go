@@ -100,57 +100,7 @@ func (c *Client) dc(
 	// explicit first transfer below is running, avoiding duplicate import.
 	var suppressSetup atomic.Bool
 	p, err := c.createPool(dcID, max, func() pool.Conn {
-		id := c.connsCounter.Inc()
-
-		c.sessionsMux.Lock()
-		sessions := c.sessions
-		if mode == manager.ConnModeCDN {
-			// Keep CDN auth key lifecycle separated from regular DC sessions.
-			sessions = c.cdnSessions
-		}
-		session, ok := sessions[dcID]
-		if !ok {
-			session = pool.NewSyncSession(pool.Session{DC: dcID})
-			sessions[dcID] = session
-		}
-		c.sessionsMux.Unlock()
-
-		options, data := session.Options(opts)
-		setup := manager.SetupCallback(nil)
-		handler := c.asHandler()
-		if mode != manager.ConnModeCDN &&
-			data.AuthKey.Zero() &&
-			c.session.Load().DC != dcID &&
-			!suppressSetup.Load() {
-			// Non-main DC key must be authorized via auth.export/import after
-			// local key generation.
-			setup = c.dcTransferSetup(dcID)
-		}
-		if mode == manager.ConnModeCDN {
-			// CDN pools do not process updates and use dedicated session store.
-			handler = c.asCDNHandler()
-		}
-		options.Logger = c.log.Named("conn").With(
-			zap.Int64("conn_id", id),
-			zap.Int("dc_id", dcID),
-		)
-		return c.create(
-			dialer, mode, c.appID,
-			options, manager.ConnOptions{
-				DC:      dcID,
-				Device:  c.device,
-				Handler: handler,
-				Setup:   setup,
-				OnDead: func(err error) {
-					if mode == manager.ConnModeCDN {
-						// CDN dead handler also manages CDN key invalidation.
-						c.handleCDNConnDead(dcID, err)
-						return
-					}
-					c.handleDCConnDead(dcID, err)
-				},
-			},
-		)
+		return c.newPoolConn(dcID, mode, dialer, opts, &suppressSetup)
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "create pool")
@@ -180,6 +130,73 @@ func (c *Client) dc(
 	}
 
 	return p, nil
+}
+
+// newPoolConn builds a single data/CDN/media pool connection for dcID. It
+// applies the same Android per-mode dial timeout and shared init-version cache
+// as the primary createConn path (via applyConnDefaults + InitCache) so the
+// download/upload pools do not silently fall back to mtproto defaults or skip
+// the per-DC init cache.
+func (c *Client) newPoolConn(
+	dcID int,
+	mode manager.ConnMode,
+	dialer mtproto.Dialer,
+	opts mtproto.Options,
+	suppressSetup *atomic.Bool,
+) pool.Conn {
+	id := c.connsCounter.Inc()
+
+	c.sessionsMux.Lock()
+	sessions := c.sessions
+	if mode == manager.ConnModeCDN {
+		// Keep CDN auth key lifecycle separated from regular DC sessions.
+		sessions = c.cdnSessions
+	}
+	session, ok := sessions[dcID]
+	if !ok {
+		session = pool.NewSyncSession(pool.Session{DC: dcID})
+		sessions[dcID] = session
+	}
+	c.sessionsMux.Unlock()
+
+	options, data := session.Options(opts)
+	setup := manager.SetupCallback(nil)
+	handler := c.asHandler()
+	if mode != manager.ConnModeCDN &&
+		data.AuthKey.Zero() &&
+		c.session.Load().DC != dcID &&
+		!suppressSetup.Load() {
+		// Non-main DC key must be authorized via auth.export/import after
+		// local key generation.
+		setup = c.dcTransferSetup(dcID)
+	}
+	if mode == manager.ConnModeCDN {
+		// CDN pools do not process updates and use dedicated session store.
+		handler = c.asCDNHandler()
+	}
+	options.Logger = c.log.Named("conn").With(
+		zap.Int64("conn_id", id),
+		zap.Int("dc_id", dcID),
+	)
+	c.applyConnDefaults(&options, mode)
+	return c.create(
+		dialer, mode, c.appID,
+		options, manager.ConnOptions{
+			DC:        dcID,
+			Device:    c.device,
+			Handler:   handler,
+			Setup:     setup,
+			InitCache: c.initVersions,
+			OnDead: func(err error) {
+				if mode == manager.ConnModeCDN {
+					// CDN dead handler also manages CDN key invalidation.
+					c.handleCDNConnDead(dcID, err)
+					return
+				}
+				c.handleDCConnDead(dcID, err)
+			},
+		},
+	)
 }
 
 // DC creates new multi-connection invoker to given DC.

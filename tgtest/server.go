@@ -48,6 +48,49 @@ type Server struct {
 	// type map for logging.
 	types *tmap.Map   // immutable
 	log   *zap.Logger // immutable
+
+	// onPing, if set, is called for every ping_delay_disconnect with the
+	// announced disconnect_delay. Test-only observability hook; nil by default.
+	onPing func(req *Request, disconnectDelay int) // nilable
+
+	// onRequest, if set, is called for every request right before it reaches the
+	// RPC handler, with req.Buf still pointing at the raw (not yet unwrapped)
+	// request. Test-only observability hook; nil by default.
+	onRequest func(req *Request) // nilable
+
+	// onSeqNo, if set, is called for every decrypted client message with its
+	// session_id, msg_id and content seqno (as carried in the encrypted message
+	// envelope, before container unpacking). Test-only observability hook; nil by
+	// default, so existing callers see zero behavior change. Intended for tests
+	// that assert seqno monotonicity / continuity across reconnects.
+	onSeqNo func(sessionID, msgID int64, seqNo int32) // nilable
+}
+
+// SetOnPing installs an observer invoked for every incoming
+// ping_delay_disconnect with the disconnect_delay announced by the client.
+// It must be set before the server starts serving. Intended for tests that
+// assert ping cadence / disconnect_delay parity.
+func (s *Server) SetOnPing(fn func(req *Request, disconnectDelay int)) {
+	s.onPing = fn
+}
+
+// SetOnRequest installs an observer invoked for every request just before it is
+// passed to the RPC handler. req.Buf still holds the raw request bytes (e.g.
+// invokeWithLayer(initConnection(...)) before UnpackInvoke unwraps them), so the
+// observer can peek a copy to count wrapper requests. It must be set before the
+// server starts serving. Intended for tests that assert initConnection parity.
+func (s *Server) SetOnRequest(fn func(req *Request)) {
+	s.onRequest = fn
+}
+
+// SetOnSeqNo installs an observer invoked for every decrypted client message
+// with its session_id, msg_id and content seqno (from the encrypted message
+// envelope, before any container unpacking). It must be set before the server
+// starts serving. Intended for tests that assert seqno continuity across
+// reconnects; nil by default, so it is a no-op for existing callers and the
+// server itself performs no seqno validation.
+func (s *Server) SetOnSeqNo(fn func(sessionID, msgID int64, seqNo int32)) {
+	s.onSeqNo = fn
 }
 
 // NewPrivateKey creates new private key from RSA private key.

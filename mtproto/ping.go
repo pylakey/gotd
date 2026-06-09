@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/go-faster/errors"
+	"go.uber.org/zap"
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/crypto"
@@ -94,9 +95,14 @@ func (c *Conn) removePong(pingID int64) {
 }
 
 func (c *Conn) pingLoop(ctx context.Context) error {
-	// If the client sends these pings once every 60 seconds,
-	// for example, it may set disconnect_delay equal to 75 seconds.
-	delay := c.pingInterval + c.pingTimeout
+	// disconnect_delay announced to the server. The official Telegram Android
+	// client decouples this from the ping cadence (generic: ping every 19s,
+	// disconnect_delay 35s). When pingDisconnect is unset we fall back to the
+	// legacy coupling: e.g. ping every 60s -> disconnect_delay 75s.
+	delay := c.pingDisconnect
+	if delay <= 0 {
+		delay = c.pingInterval + c.pingTimeout
+	}
 
 	ticker := c.clock.Ticker(c.pingInterval)
 	defer ticker.Stop()
@@ -106,6 +112,7 @@ func (c *Conn) pingLoop(ctx context.Context) error {
 		case <-ctx.Done():
 			return errors.Wrap(ctx.Err(), "ping loop")
 		case <-ticker.C():
+			start := c.clock.Now()
 			if err := func() error {
 				ctx, cancel := context.WithTimeout(ctx, c.pingTimeout)
 				defer cancel()
@@ -114,6 +121,13 @@ func (c *Conn) pingLoop(ctx context.Context) error {
 			}(); err != nil {
 				return errors.Wrap(err, "disconnect (pong missed)")
 			}
+			// One debug line per keepalive (cadence ~pingInterval) to observe
+			// ping_delay_disconnect timing and round-trip during debugging.
+			c.log.Debug("ping_delay_disconnect",
+				zap.Duration("interval", c.pingInterval),
+				zap.Int("disconnect_delay_s", int(delay.Seconds())),
+				zap.Duration("rtt", c.clock.Now().Sub(start)),
+			)
 		}
 	}
 }

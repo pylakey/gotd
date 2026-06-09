@@ -93,6 +93,18 @@ type Data struct {
 	AuthKey   []byte
 	AuthKeyID []byte
 	Salt      int64
+	// InitVersions holds, per DC id, the initConnection version already
+	// negotiated with the server. It mirrors the official Telegram Android
+	// client's persisted per-DC init version, letting a process skip re-sending
+	// initConnection after a restart. Absent in older session files — they
+	// simply load with an empty map and re-init once.
+	InitVersions map[int]int64
+	// TimeOffset is the persistent server-time offset in seconds (server -
+	// local), mirroring the official client's timeDifference. Persisting it lets
+	// a restarted process generate the first msg_id already aligned with the
+	// server clock instead of re-learning the skew. JSON-additive: absent in
+	// older session files, which load as offset 0.
+	TimeOffset int
 }
 
 // Storage is secure persistent storage for client session.

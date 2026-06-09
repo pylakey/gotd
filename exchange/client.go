@@ -29,6 +29,11 @@ type ClientExchangeResult struct {
 	AuthKey    crypto.AuthKey
 	SessionID  int64
 	ServerSalt int64
+	// ServerTime is the server clock (unix seconds) reported in
+	// server_DH_inner_data during the exchange. Callers use it to seed the
+	// persistent server-time offset so msg_id generation starts aligned with the
+	// server even when the local clock is skewed. Zero if unavailable.
+	ServerTime int64
 	// ExpiresAt is unix timestamp for temporary keys, zero for permanent.
 	ExpiresAt int64
 }

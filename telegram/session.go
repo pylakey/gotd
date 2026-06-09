@@ -42,6 +42,15 @@ func (c *Client) restoreConnection(ctx context.Context) error {
 		return errors.New("corrupted key")
 	}
 
+	// Seed per-DC initConnection versions so a restarted process can skip
+	// re-sending initConnection to DCs it already initialized (Android
+	// lastInitVersion persistence).
+	c.initVersions.Restore(data.InitVersions)
+
+	// Seed the persistent server-time offset so the first msg_id after restart
+	// is already aligned with the server clock (Android timeDifference).
+	c.timeOffset.Store(data.TimeOffset)
+
 	// Re-initializing connection from persisted state.
 	c.log.Info("Connection restored from state",
 		zap.String("addr", data.Addr),
@@ -86,6 +95,13 @@ func (c *Client) saveSession(cfg tg.Config, s mtproto.Session) error {
 	data.AuthKeyID = keyToSave.ID[:]
 	data.DC = cfg.ThisDC
 	data.Salt = s.Salt
+	// Persist per-DC initConnection versions (Android lastInitVersion).
+	if snap := c.initVersions.Snapshot(); snap != nil {
+		data.InitVersions = snap
+	}
+	// Persist server-time offset (Android timeDifference) so a restarted process
+	// generates its first msg_id aligned with the server clock.
+	data.TimeOffset = c.timeOffset.Load()
 
 	if err := c.storage.Save(c.ctx, data); err != nil {
 		return errors.Wrap(err, "save")
@@ -109,7 +125,9 @@ func (c *Client) onSession(cfg tg.Config, s mtproto.Session) error {
 	}
 
 	c.connMux.Lock()
-	c.session.Store(sessionData)
+	// StoreCarry keeps the seqno monotonic for a continued session_id so the
+	// live-seqno carry and new_session_created event cannot regress it.
+	c.session.StoreCarry(sessionData)
 	c.cfg.Store(cfg)
 	c.onReady()
 	c.connMux.Unlock()
@@ -131,7 +149,8 @@ func (c *Client) onCDNSession(cfg tg.Config, s mtproto.Session) error {
 func (c *Client) storeDCSess(target map[int]*pool.SyncSession, data pool.Session) {
 	c.sessionsMux.Lock()
 	if existing, ok := target[data.DC]; ok {
-		existing.Store(data)
+		// Keep seqno monotonic for a continued session_id (see StoreCarry).
+		existing.StoreCarry(data)
 		c.sessionsMux.Unlock()
 		return
 	}
@@ -151,5 +170,10 @@ func dcSessionFromMTProto(dc int, s mtproto.Session) pool.Session {
 		DC:      dc,
 		Salt:    s.Salt,
 		AuthKey: keyToStore,
+		// Carry MTProto session_id and seqno in memory so the next reconnect to
+		// this DC continues the session instead of recreating it. Not persisted
+		// to disk: like the official client, these live only in memory.
+		SessionID: s.ID,
+		SeqNo:     s.SeqNo,
 	}
 }

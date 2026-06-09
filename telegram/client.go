@@ -110,6 +110,15 @@ type Client struct {
 	// cdnSessions stores session state for CDN pools separately from regular DCs.
 	cdnSessions map[int]*pool.SyncSession
 	sessionsMux sync.Mutex
+	// initVersions tracks per-DC negotiated initConnection versions so reconnects
+	// skip re-sending initConnection (Android lastInitVersion). Persisted via
+	// session.Data to survive process restart.
+	initVersions *manager.InitVersionCache
+	// timeOffset is the persistent server-time offset (server - local), owned
+	// here so it survives per-reconnect Conn recreation and is shared with the
+	// msg_id generator. Seeded from session.Data on restore, persisted on save
+	// (Android timeDifference).
+	timeOffset *mtproto.ServerTimeOffset
 	// CDN public keys loaded from help.getCdnConfig and cached per CDN DC.
 	cdnKeys     []PublicKey
 	cdnKeysByDC map[int][]PublicKey
@@ -222,8 +231,16 @@ func NewClient(appID int, appHash string, opt Options) *Client {
 		MaxRetries:        opt.MaxRetries,
 		CompressThreshold: opt.CompressThreshold,
 		MessageID:         opt.MessageID,
-		ExchangeTimeout:   opt.ExchangeTimeout,
-		DialTimeout:       opt.DialTimeout,
+		// Shared persistent server-time offset (Android timeDifference): owned by
+		// the Client so it survives per-reconnect Conn recreation and is applied
+		// to msg_id generation and inbound id-bounds checks.
+		TimeOffset:      client.timeOffset,
+		ExchangeTimeout: opt.ExchangeTimeout,
+		DialTimeout:     opt.DialTimeout,
+		// Telegram Android keepalive cadence (decoupled disconnect_delay).
+		PingInterval:        opt.PingInterval,
+		PingTimeout:         opt.PingTimeout,
+		PingDisconnectDelay: opt.PingDisconnectDelay,
 		// Forward PFS toggles into low-level mtproto connection.
 		EnablePFS:  opt.EnablePFS,
 		TempKeyTTL: opt.TempKeyTTL,
@@ -251,6 +268,12 @@ func (c *Client) init() {
 	c.migration = make(chan struct{}, 1)
 	c.sessions = map[int]*pool.SyncSession{}
 	c.cdnSessions = map[int]*pool.SyncSession{}
+	if c.initVersions == nil {
+		c.initVersions = manager.NewInitVersionCache()
+	}
+	if c.timeOffset == nil {
+		c.timeOffset = mtproto.NewServerTimeOffset(0)
+	}
 	c.subConns = map[int]CloseInvoker{}
 	c.cdnPools = newCDNPoolManager()
 	// CDN key cache is cold-started and filled lazily on first CDN pool create.

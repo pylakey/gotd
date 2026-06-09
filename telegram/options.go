@@ -13,7 +13,6 @@ import (
 	"github.com/gotd/td/crypto"
 	"github.com/gotd/td/exchange"
 	"github.com/gotd/td/mtproto"
-	"github.com/gotd/td/proto"
 	"github.com/gotd/td/telegram/dcs"
 	"github.com/gotd/td/tg"
 )
@@ -88,6 +87,16 @@ type Options struct {
 	ExchangeTimeout time.Duration
 	// DialTimeout is timeout of creating connection.
 	DialTimeout time.Duration
+	// PingInterval is the cadence of ping_delay_disconnect keepalives.
+	// Default mirrors the Telegram Android generic connection: 19s.
+	PingInterval time.Duration
+	// PingTimeout is how long to wait for a pong before treating the connection
+	// as dead. Default 35s (the announced disconnect_delay window).
+	PingTimeout time.Duration
+	// PingDisconnectDelay is the disconnect_delay announced to the server in
+	// ping_delay_disconnect, decoupled from the ping cadence as in Telegram
+	// Android (generic: ping 19s, disconnect_delay 35s). Default 35s.
+	PingDisconnectDelay time.Duration
 	// EnablePFS enables Perfect Forward Secrecy with temporary auth keys.
 	EnablePFS bool
 	// TempKeyTTL controls temporary key lifetime in seconds.
@@ -149,6 +158,17 @@ func (opt *Options) setDefaults() {
 	// It's okay to use zero value MaxRetries, mtproto.Options will set defaults.
 	// It's okay to use zero value CompressThreshold, mtproto.Options will set defaults.
 	opt.Device.SetDefaults()
+	// Telegram Android generic-connection keepalive, decoupling the ping cadence
+	// (19s) from the announced disconnect_delay (35s).
+	if opt.PingInterval == 0 {
+		opt.PingInterval = 19 * time.Second
+	}
+	if opt.PingDisconnectDelay == 0 {
+		opt.PingDisconnectDelay = 35 * time.Second
+	}
+	if opt.PingTimeout == 0 {
+		opt.PingTimeout = 35 * time.Second
+	}
 	if opt.Clock == nil {
 		opt.Clock = clock.System
 	}
@@ -158,9 +178,11 @@ func (opt *Options) setDefaults() {
 	if opt.MigrationTimeout == 0 {
 		opt.MigrationTimeout = time.Second * 15
 	}
-	if opt.MessageID == nil {
-		opt.MessageID = proto.NewMessageIDGen(opt.Clock.Now)
-	}
+	// MessageID is intentionally left nil here when not user-supplied: the
+	// mtproto layer builds the generator from its server-time clock (local +
+	// persistent offset) so msg_id stays inside the server's accept window even
+	// under local clock skew. Defaulting it to a plain system-clock generator
+	// here would bypass that offset.
 	if opt.UpdateHandler == nil {
 		// No updates handler passed, so no sense to subscribe for updates.
 		// User should explicitly ignore updates using custom UpdateHandler.
@@ -176,13 +198,13 @@ func (opt *Options) setDefaults() {
 	}
 }
 
-func defaultBackoff(c clock.Clock) func() backoff.BackOff {
+// defaultBackoff builds the reconnect backoff factory. The default mirrors the
+// Telegram Android (tgnet) profile (see reconnectBackoff): 50→100→200→400ms
+// doubling on socket-level network failures and a fixed 1s delay on clean
+// drops, retrying indefinitely. The clock argument is unused (the Android
+// profile is duration-only) but kept for signature stability with the option.
+func defaultBackoff(clock.Clock) func() backoff.BackOff {
 	return func() backoff.BackOff {
-		b := backoff.NewExponentialBackOff()
-		b.Clock = c
-		b.MaxElapsedTime = 0
-		b.MaxInterval = time.Second * 5
-		b.InitialInterval = time.Millisecond * 100
-		return b
+		return newReconnectBackoff()
 	}
 }

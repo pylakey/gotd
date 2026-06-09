@@ -24,6 +24,9 @@ type ConnOptions struct {
 	Setup   SetupCallback
 	OnDead  func(error)
 	Backoff func(ctx context.Context) backoff.BackOff
+	// InitCache, if non-nil, lets the connection skip re-sending initConnection
+	// to a DC whose init version is already cached (Android lastInitVersion).
+	InitCache *InitVersionCache
 }
 
 func defaultBackoff(c clock.Clock) func(ctx context.Context) backoff.BackOff {
@@ -74,6 +77,7 @@ func CreateConn(
 		setup:       connOpts.Setup,
 		onDead:      connOpts.OnDead,
 		connBackoff: connOpts.Backoff,
+		initCache:   connOpts.InitCache,
 	}
 	if mode == ConnModeCDN {
 		conn.cdnNeedsInit.Store(true)

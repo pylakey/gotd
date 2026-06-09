@@ -10,6 +10,7 @@ import (
 
 	"github.com/gotd/td/bin"
 	"github.com/gotd/td/clock"
+	"github.com/gotd/td/mtproto"
 	"github.com/gotd/td/tdsync"
 	"github.com/gotd/td/tg"
 	"github.com/gotd/td/tgerr"
@@ -34,6 +35,10 @@ func (p *captureProto) Run(ctx context.Context, f func(ctx context.Context) erro
 
 func (*captureProto) Ping(context.Context) error {
 	return nil
+}
+
+func (*captureProto) Session() mtproto.Session {
+	return mtproto.Session{}
 }
 
 func newTestConn(mode ConnMode, proto protoConn) *Conn {
@@ -160,6 +165,10 @@ func (*retryOnRawNotInitedProto) Ping(context.Context) error {
 	return nil
 }
 
+func (*retryOnRawNotInitedProto) Session() mtproto.Session {
+	return mtproto.Session{}
+}
+
 type rawMethodInvalidProto struct {
 	calls        []bin.Encoder
 	rawErrBudget int
@@ -180,6 +189,10 @@ func (p *rawMethodInvalidProto) Run(ctx context.Context, f func(ctx context.Cont
 
 func (*rawMethodInvalidProto) Ping(context.Context) error {
 	return nil
+}
+
+func (*rawMethodInvalidProto) Session() mtproto.Session {
+	return mtproto.Session{}
 }
 
 func TestConnInvokeCDNFirstCallWrapped(t *testing.T) {

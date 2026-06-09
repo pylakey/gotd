@@ -60,7 +60,13 @@ type Conn struct {
 
 	// Wrappers for external world, like current time, logs or PRNG.
 	// Should be immutable.
-	clock        clock.Clock
+	clock clock.Clock
+	// timeOffset holds the persistent server-time offset (server - local), owned
+	// above this Conn so corrections survive reconnects. serverNow() applies it
+	// to clock to estimate the server clock, used for both msg_id generation and
+	// inbound id-bounds checks. May be nil in bare test constructions, in which
+	// case serverNow() falls back to clock.
+	timeOffset   *ServerTimeOffset
 	rand         io.Reader
 	cipher       Cipher
 	log          *zap.Logger
@@ -101,6 +107,10 @@ type Conn struct {
 	pingTimeout time.Duration
 	// pingInterval is duration between ping_delay_disconnect request.
 	pingInterval time.Duration
+	// pingDisconnect is the disconnect_delay announced in ping_delay_disconnect,
+	// decoupled from pingInterval as in Telegram Android. Zero falls back to
+	// pingInterval+pingTimeout.
+	pingDisconnect time.Duration
 
 	// gotSession is a signal channel for wait for handleSessionCreated message.
 	gotSession *tdsync.Ready
@@ -133,6 +143,7 @@ func New(dialer Dialer, opt Options) *Conn {
 
 		dialer:       dialer,
 		clock:        opt.Clock,
+		timeOffset:   opt.TimeOffset,
 		rand:         opt.Random,
 		cipher:       opt.Cipher,
 		log:          opt.Logger,
@@ -147,13 +158,17 @@ func New(dialer Dialer, opt Options) *Conn {
 		handler:       opt.Handler,
 		types:         opt.Types,
 
-		authKey: opt.Key,
-		permKey: opt.PermKey,
-		salt:    opt.Salt,
+		authKey:   opt.Key,
+		permKey:   opt.PermKey,
+		salt:      opt.Salt,
+		sessionID: opt.SessionID,
 
-		ping:         map[int64]chan struct{}{},
-		pingTimeout:  opt.PingTimeout,
-		pingInterval: opt.PingInterval,
+		sentContentMessages: opt.SeqNo,
+
+		ping:           map[int64]chan struct{}{},
+		pingTimeout:    opt.PingTimeout,
+		pingInterval:   opt.PingInterval,
+		pingDisconnect: opt.PingDisconnectDelay,
 
 		gotSession: tdsync.NewReady(),
 
@@ -173,6 +188,15 @@ func New(dialer Dialer, opt Options) *Conn {
 		if conn.permKey.Zero() && !opt.Key.Zero() {
 			conn.permKey = opt.Key
 		}
+		// Session continuity does not apply in PFS: the per-connection temp key
+		// bind is a re-handshake that mints a fresh session_id.
+		conn.sessionID = 0
+		conn.sentContentMessages = 0
+	} else if conn.sessionID != 0 && !conn.authKey.Zero() {
+		// Restoring an existing non-PFS session on a plain reconnect: the server
+		// will not necessarily re-send new_session_created, so seed gotSession
+		// to unblock the salt loop (which otherwise waits for that event).
+		conn.gotSession.Signal()
 	}
 	if conn.rpc == nil {
 		conn.rpc = rpc.New(conn.writeContentMessage, rpc.Options{

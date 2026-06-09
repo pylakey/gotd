@@ -152,6 +152,22 @@ func (g *MessageIDGen) New(t MessageType) int64 {
 	return int64(NewMessageIDNano(g.nano, t))
 }
 
+// Reset drops the monotonic high-water mark so the next New() call re-anchors to
+// the current value of now().
+//
+// The generator keeps a high-water mark (the last nanosecond timestamp it
+// emitted) to avoid id collisions when now() has coarse resolution. That mark
+// only ever moves forward. After a downward server-time correction the backing
+// clock (local time plus the corrected server-time offset) drops below the mark,
+// so without resetting it the generator would keep emitting ids just above the
+// stale, too-high mark and the server would reject them again. Reset clears the
+// mark so the next id tracks the corrected (lower) clock.
+func (g *MessageIDGen) Reset() {
+	g.mux.Lock()
+	g.nano = 0
+	g.mux.Unlock()
+}
+
 // NewMessageIDGen creates new message id generator.
 //
 // Current time will be provided by now() function.

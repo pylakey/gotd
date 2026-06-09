@@ -81,13 +81,20 @@ func (c *Client) isPermanentError(err error) bool {
 func (c *Client) reconnectUntilClosed(ctx context.Context) error {
 	// Note that we currently have no timeout on connection, so this is
 	// potentially eternal.
-	b := tdsync.SyncBackoff(backoff.WithContext(c.newConnBackoff(), ctx))
+	raw := c.newConnBackoff()
+	b := tdsync.SyncBackoff(backoff.WithContext(raw, ctx))
 	c.connBackoff.Store(&b)
 
 	return backoff.RetryNotify(func() error {
 		if err := c.runUntilRestart(ctx); err != nil {
 			if c.isPermanentError(err) {
 				return backoff.Permanent(err)
+			}
+			// Feed the disconnect reason to the Android-style two-mode backoff
+			// (socket failure -> fast doubling, clean drop -> fixed 1s) before
+			// RetryNotify calls NextBackOff on this same goroutine.
+			if ea, ok := raw.(*reconnectBackoff); ok {
+				ea.setLastError(err)
 			}
 			return err
 		}

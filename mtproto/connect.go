@@ -152,6 +152,8 @@ func (c *Conn) createAuthKey(ctx context.Context) error {
 	c.salt = r.ServerSalt
 	c.sessionMux.Unlock()
 
+	c.seedTimeOffsetFromExchange(r.ServerTime)
+
 	return nil
 }
 
@@ -196,6 +198,8 @@ func (c *Conn) createTempAuthKey(ctx context.Context) error {
 	c.salt = r.ServerSalt
 	c.tempKeyExpiry = expiresAt
 	c.sessionMux.Unlock()
+
+	c.seedTimeOffsetFromExchange(r.ServerTime)
 
 	return nil
 }

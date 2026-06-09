@@ -2,6 +2,8 @@ package manager
 
 import (
 	"context"
+	"fmt"
+	"hash/fnv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -23,6 +25,7 @@ type protoConn interface {
 	Invoke(ctx context.Context, input bin.Encoder, output bin.Decoder) error
 	Run(ctx context.Context, f func(ctx context.Context) error) error
 	Ping(ctx context.Context) error
+	Session() mtproto.Session
 }
 
 //go:generate go run -modfile=../../../_tools/go.mod golang.org/x/tools/cmd/stringer -type=ConnMode
@@ -57,6 +60,10 @@ type Conn struct {
 
 	// onDead is called on connection death.
 	onDead func(error)
+
+	// initCache, if non-nil, holds per-DC negotiated init versions so reconnects
+	// to an already-initialized DC skip re-sending the full initConnection.
+	initCache *InitVersionCache // nilable
 
 	// Wrappers for external world, like logs or PRNG.
 	// Should be immutable.
@@ -168,6 +175,12 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 			}
 		}
 	}()
+	// Carry the live session (including the current content seqno) out of the
+	// dying connection so the next reconnect to this DC continues the sequence
+	// instead of resuming from the seqno snapshotted once at new_session_created
+	// time. Without this the resumed seqno is stale-low and the server rejects
+	// it (bad_msg code 32), degrading every reconnect to a fresh session.
+	defer c.carryLiveSession()
 	return c.proto.Run(ctx, func(ctx context.Context) error {
 		// Signal death on init error to unblock waiters in waitSession/OnSession.
 		err := c.init(ctx)
@@ -176,6 +189,28 @@ func (c *Conn) Run(ctx context.Context) (err error) {
 		}
 		return err
 	})
+}
+
+// carryLiveSession snapshots the live MTProto session of the just-terminated
+// connection and replays it through the session handler so the stored per-DC
+// session refreshes its seqno (and salt) from the live value. It only runs once
+// config is known (otherwise there is no DC to attribute the session to and the
+// snapshot is the initial empty one).
+func (c *Conn) carryLiveSession() {
+	if !c.configReady() {
+		return
+	}
+	s := c.proto.Session()
+	if s.ID == 0 {
+		// No established session to carry.
+		return
+	}
+	c.mux.Lock()
+	cfg := c.cfg
+	c.mux.Unlock()
+	if err := c.handler.OnSession(cfg, s); err != nil {
+		c.log.Debug("Failed to carry live session on shutdown", zap.Error(err))
+	}
 }
 
 func (c *Conn) waitSession(ctx context.Context) error {
@@ -332,32 +367,43 @@ func (c *Conn) init(ctx context.Context) error {
 		err := c.flushPendingSession()
 		return err
 	}
-	q := c.wrapRequest(&tg.InitConnectionRequest{
-		APIID:          c.appID,
-		DeviceModel:    c.device.DeviceModel,
-		SystemVersion:  c.device.SystemVersion,
-		AppVersion:     c.device.AppVersion,
-		SystemLangCode: c.device.SystemLangCode,
-		LangPack:       c.device.LangPack,
-		LangCode:       c.device.LangCode,
-		Proxy:          c.device.Proxy,
-		Params:         c.device.Params,
-		Query:          c.wrapRequest(&tg.HelpGetConfigRequest{}),
-	})
-	req := c.wrapRequest(&tg.InvokeWithLayerRequest{
-		Layer: tg.Layer,
-		Query: q,
-	})
+	version := c.initVersion()
+	// Skip the full initConnection if this DC already accepted the same init
+	// version (Android-style cached init version). The connection still refreshes
+	// config via a bare invokeWithLayer(help.getConfig) so it becomes ready
+	// (gotConfig must signal regardless of the skip).
+	skipInit := c.initCache.Done(c.dc, version)
+
+	if skipInit {
+		c.log.Debug("Skipping initConnection (cached init version)",
+			zap.Int("dc_id", c.dc), zap.Int64("init_version", version),
+		)
+	}
 
 	var cfg tg.Config
 	if err := backoff.RetryNotify(func() error {
-		if err := c.proto.Invoke(ctx, req, &cfg); err != nil {
+		if err := c.proto.Invoke(ctx, c.initRequest(skipInit), &cfg); err != nil {
 			if tgerr.Is(err, tgerr.ErrFloodWait) {
 				// Server sometimes returns FLOOD_WAIT(0) if you create
 				// multiple connections in short period of time.
 				//
 				// See https://github.com/gotd/td/issues/388.
 				return errors.Wrap(err, "flood wait")
+			}
+			// On the skip path the server may reject the bare
+			// invokeWithLayer(getConfig) when its init state (bound to the
+			// auth_key) diverged from our cache — e.g. a restored session whose
+			// key was rotated server-side. Bust the stale cache entry and retry
+			// once with the full initConnection in the same init() call, mirroring
+			// the CDN shouldCDNRetryWrapped recovery. Without this the connection
+			// would loop forever: reconnect -> skip -> reject -> permanent error.
+			if skipInit && c.shouldRetryFullInit(err) {
+				c.log.Debug("Cached init rejected by server; recovering with full initConnection",
+					zap.Int("dc_id", c.dc), zap.Int64("init_version", version),
+				)
+				c.initCache.Delete(c.dc)
+				skipInit = false
+				return errors.Wrap(err, "cached init rejected")
 			}
 			// Not retrying other errors.
 			return backoff.Permanent(errors.Wrap(err, "invoke"))
@@ -383,9 +429,99 @@ func (c *Conn) init(ctx context.Context) error {
 	c.cfg = cfg
 	c.mux.Unlock()
 
+	// Record the negotiated init version only after a successful full init
+	// (as Android records it after a non-error reply), so a failed init is
+	// retried, not cached.
+	if !skipInit {
+		c.initCache.Set(c.dc, version)
+	}
+
 	c.gotConfig.Signal()
 	err := c.flushPendingSession()
 	return err
+}
+
+// initRequest builds the init() invoke. When skip is true it sends a bare
+// invokeWithLayer(getConfig) (relying on the server-side cached init state);
+// otherwise it sends the full invokeWithLayer(initConnection(getConfig)).
+func (c *Conn) initRequest(skip bool) bin.Object {
+	if skip {
+		return c.wrapRequest(&tg.InvokeWithLayerRequest{
+			Layer: tg.Layer,
+			Query: c.wrapRequest(&tg.HelpGetConfigRequest{}),
+		})
+	}
+	q := c.wrapRequest(&tg.InitConnectionRequest{
+		APIID:          c.appID,
+		DeviceModel:    c.device.DeviceModel,
+		SystemVersion:  c.device.SystemVersion,
+		AppVersion:     c.device.AppVersion,
+		SystemLangCode: c.device.SystemLangCode,
+		LangPack:       c.device.LangPack,
+		LangCode:       c.device.LangCode,
+		Proxy:          c.device.Proxy,
+		Params:         c.device.Params,
+		Query:          c.wrapRequest(&tg.HelpGetConfigRequest{}),
+	})
+	return c.wrapRequest(&tg.InvokeWithLayerRequest{
+		Layer: tg.Layer,
+		Query: q,
+	})
+}
+
+// shouldRetryFullInit reports whether a skip-path init error signals that the
+// server's init state (which is bound to the auth_key) diverged from our cache
+// and a full initConnection must be re-sent. Mirrors shouldCDNRetryWrapped.
+func (c *Conn) shouldRetryFullInit(err error) bool {
+	rpcErr, ok := tgerr.As(err)
+	if !ok {
+		return false
+	}
+	return rpcErr.IsOneOf(
+		"CONNECTION_NOT_INITED",
+		"CONNECTION_LAYER_INVALID",
+	)
+}
+
+// initVersion returns a stable hash of the initConnection payload identity
+// (app id, device, system and language parameters) plus the connection's
+// auth_key_id. A change in any of these forces a fresh initConnection,
+// mirroring how the Telegram Android client re-initializes on app build /
+// language change. Including the auth_key_id self-busts the per-DC cache when a
+// DC's cached init version outlives its auth_key (restored session whose key
+// was rotated server-side, or migrate-away-and-back with a fresh key), because
+// the server's init state is bound to the auth_key.
+func (c *Conn) initVersion() int64 {
+	h := fnv.New64a()
+	_, _ = fmt.Fprintf(h, "%d\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d",
+		c.appID,
+		c.device.DeviceModel,
+		c.device.SystemVersion,
+		c.device.AppVersion,
+		c.device.SystemLangCode,
+		c.device.LangPack,
+		c.device.LangCode,
+		c.authKeyID(),
+	)
+	return int64(h.Sum64())
+}
+
+// authKeyID returns the fingerprint of the connection's stable auth key, or 0
+// if no key is established yet. It is read from the live MTProto session, which
+// is cheap and lock-guarded by the proto connection.
+//
+// In PFS mode the runtime Key is the per-connection temporary key, which is
+// regenerated on every reconnect; keying the init version off it would bust the
+// cache on every connection and defeat the purpose. We therefore use the stable
+// permanent key (PermKey) in PFS — init state is bound to the permanent key and
+// survives temporary-key rotation, matching the official client. Outside PFS,
+// PermKey is zero and Key is the long-lived key.
+func (c *Conn) authKeyID() int64 {
+	s := c.proto.Session()
+	if !s.PermKey.Zero() {
+		return s.PermKey.IntID()
+	}
+	return s.Key.IntID()
 }
 
 // Ping calls ping for underlying protocol connection.

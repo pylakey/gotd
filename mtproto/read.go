@@ -27,6 +27,25 @@ const (
 // errRejected is returned on invalid message that should not be processed.
 var errRejected = errors.New("message rejected")
 
+// errStaleMessageID marks the subset of rejections that signal our inbound
+// msg_id window has diverged from the server's: an already-processed
+// (duplicate / too-low) msg_id or a msg_id created too far in the past. These
+// are recreate-session triggers — continuing on a stale window can make a
+// desync permanent. A "too far in future" id is excluded (local clock skew, not
+// a session desync) as is a foreign session_id (potential replay of another
+// session), so neither rotates.
+//
+// It also satisfies errors.Is(err, errRejected) so the message itself is still
+// ignored rather than treated as a fatal read error.
+var errStaleMessageID = staleMessageIDError{}
+
+type staleMessageIDError struct{}
+
+func (staleMessageIDError) Error() string { return "stale message id" }
+func (staleMessageIDError) Is(target error) bool {
+	return target == errRejected || target == errStaleMessageID
+}
+
 func checkMessageID(now time.Time, rawID int64) error {
 	id := proto.MessageID(rawID)
 
@@ -40,7 +59,7 @@ func checkMessageID(now time.Time, rawID int64) error {
 
 	created := id.Time()
 	if created.Before(now) && now.Sub(created) > maxPast {
-		return errors.Wrap(errRejected, "created too far in past")
+		return errors.Wrap(errStaleMessageID, "created too far in past")
 	}
 	if created.Sub(now) > maxFuture {
 		return errors.Wrap(errRejected, "created too far in future")
@@ -60,18 +79,39 @@ func (c *Conn) decryptMessage(b *bin.Buffer) (*crypto.EncryptedMessageData, erro
 	if msg.SessionID != session.ID {
 		return nil, errors.Wrapf(errRejected, "invalid session (got %d, expected %d)", msg.SessionID, session.ID)
 	}
-	if err := checkMessageID(c.clock.Now(), msg.MessageID); err != nil {
+	if err := checkMessageID(c.serverNow(), msg.MessageID); err != nil {
 		return nil, errors.Wrapf(err, "bad message id %d", msg.MessageID)
 	}
-	if !c.messageIDBuf.Consume(msg.MessageID) {
-		return nil, errors.Wrapf(errRejected, "duplicate or too low message id %d", msg.MessageID)
+	if !c.consumeMessageID(msg.MessageID) {
+		return nil, errors.Wrapf(errStaleMessageID, "duplicate or too low message id %d", msg.MessageID)
 	}
 
 	return msg, nil
 }
 
+// consumeMessageID checks the inbound msg_id against the replay-protection
+// buffer. The buffer is read under sessionMux because recreateSession may swap
+// it atomically with the session_id / seqno rotation.
+func (c *Conn) consumeMessageID(msgID int64) bool {
+	c.sessionMux.RLock()
+	buf := c.messageIDBuf
+	c.sessionMux.RUnlock()
+	return buf.Consume(msgID)
+}
+
 func (c *Conn) consumeMessage(ctx context.Context, buf *bin.Buffer) error {
 	msg, err := c.decryptMessage(buf)
+	if errors.Is(err, errStaleMessageID) {
+		// Our inbound msg_id window diverged from the server's. Rotate the
+		// session (new session_id, seqno reset, replay buffer reset) so the
+		// next reconnect cannot inherit the stale window, then ignore this
+		// message.
+		c.log.Warn("Recreating session on stale inbound message id", zap.Error(err))
+		if rErr := c.recreateSession(); rErr != nil {
+			return errors.Wrap(rErr, "recreate session")
+		}
+		return nil
+	}
 	if errors.Is(err, errRejected) {
 		c.log.Warn("Ignoring rejected message", zap.Error(err))
 		return nil
