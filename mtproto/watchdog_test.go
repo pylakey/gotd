@@ -449,6 +449,227 @@ func TestConnRun_TeardownUnblocksBlockedRead(t *testing.T) {
 	}
 }
 
+// halfOpenNetConn is a net.Conn whose peer is gone: Read blocks until the read
+// deadline is set in the past (then returns an i/o timeout, exactly like a real
+// net.Conn), Write succeeds (drops), Close unblocks a blocked Read. This is the
+// faithful net.Conn a real half-open socket presents. Wrapped in a REAL
+// transport.connection (via Protocol.Handshake) it exercises the production read
+// path — codec framing, the per-Recv readMux, and the SetReadDeadline(zero)
+// reset at the top of every Recv — that the transport-level mocks above bypass.
+type halfOpenNetConn struct {
+	mu       sync.Mutex
+	deadline time.Time
+	wake     chan struct{}
+	closed   chan struct{}
+	closeOne sync.Once
+}
+
+func newHalfOpenNetConn() *halfOpenNetConn {
+	return &halfOpenNetConn{wake: make(chan struct{}, 1), closed: make(chan struct{})}
+}
+
+func (c *halfOpenNetConn) Read(b []byte) (int, error) {
+	for {
+		c.mu.Lock()
+		dl := c.deadline
+		c.mu.Unlock()
+		if !dl.IsZero() && !time.Now().Before(dl) {
+			return 0, &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+		var timerC <-chan time.Time
+		var timer *time.Timer
+		if !dl.IsZero() {
+			timer = time.NewTimer(time.Until(dl))
+			timerC = timer.C
+		}
+		select {
+		case <-c.closed:
+			if timer != nil {
+				timer.Stop()
+			}
+			return 0, net.ErrClosed
+		case <-c.wake:
+			if timer != nil {
+				timer.Stop()
+			}
+			// Deadline changed: re-evaluate.
+		case <-timerC:
+			return 0, &net.OpError{Op: "read", Net: "tcp", Err: os.ErrDeadlineExceeded}
+		}
+	}
+}
+
+func (c *halfOpenNetConn) Write(b []byte) (int, error) { return len(b), nil }
+
+func (c *halfOpenNetConn) SetReadDeadline(t time.Time) error {
+	c.mu.Lock()
+	c.deadline = t
+	c.mu.Unlock()
+	select {
+	case c.wake <- struct{}{}:
+	default:
+	}
+	return nil
+}
+
+func (c *halfOpenNetConn) SetWriteDeadline(time.Time) error { return nil }
+func (c *halfOpenNetConn) SetDeadline(t time.Time) error    { return c.SetReadDeadline(t) }
+func (c *halfOpenNetConn) Close() error {
+	c.closeOne.Do(func() { close(c.closed) })
+	return nil
+}
+func (c *halfOpenNetConn) LocalAddr() net.Addr  { return dummyAddr{} }
+func (c *halfOpenNetConn) RemoteAddr() net.Addr { return dummyAddr{} }
+
+type dummyAddr struct{}
+
+func (dummyAddr) Network() string { return "tcp" }
+func (dummyAddr) String() string  { return "half-open" }
+
+var _ net.Conn = (*halfOpenNetConn)(nil)
+
+// TestConnRun_TeardownUnblocksThroughRealTransport is the production-faithful
+// version of TestConnRun_TeardownUnblocksBlockedRead: instead of using a mock as
+// the transport.Conn directly, it wraps a half-open net.Conn in a REAL
+// transport.connection (intermediate codec). readLoop therefore blocks in the
+// real codec read path, and handleClose must unblock it through
+// connection.SetReadDeadline -> net.Conn.SetReadDeadline. If the fix only worked
+// against the transport-level mock (which has no readMux / no per-Recv deadline
+// reset) this would wedge; with the real layer it must still return.
+func TestConnRun_TeardownUnblocksThroughRealTransport(t *testing.T) {
+	a := require.New(t)
+
+	netc := newHalfOpenNetConn()
+	tr, err := transport.Intermediate.Handshake(netc)
+	a.NoError(err)
+
+	c := neo.NewTime(time.Now())
+	conn := newWatchdogConn(t, tr, c, true)
+	conn.readTimeout = 0 // isolate the teardown path (watchdog disabled)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- conn.Run(ctx, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+
+	// Give readLoop time to block in the real codec read.
+	waitFor(t, func() bool { return true })
+	time.Sleep(50 * time.Millisecond)
+
+	cancel() // group cancel -> handleClose must unblock the real codec read.
+
+	select {
+	case <-runErr:
+		// GREEN: conn.Run unwound through the real transport layer.
+	case <-time.After(5 * time.Second):
+		a.Fail("conn.Run wedged through real transport.connection: handleClose did not unblock the codec read")
+	}
+}
+
+// blockingMsgHandler blocks forever in OnMessage, modelling an already-decoded
+// update whose handoff to the CLIENT-LEVEL updates manager has stalled (the
+// manager's queue is full and its consumer is itself waiting on getDifference
+// against the dying connection). entered fires once the handler is reached.
+type blockingMsgHandler struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (h *blockingMsgHandler) OnMessage(b *bin.Buffer) error {
+	select {
+	case h.entered <- struct{}{}:
+	default:
+	}
+	<-h.release
+	return nil
+}
+
+func (h *blockingMsgHandler) OnSession(Session) error { return nil }
+
+// oneShotConn delivers a single pre-crafted frame on the first Recv, then blocks
+// like a silent socket (delegating to the embedded blackholeConn).
+type oneShotConn struct {
+	*blackholeConn
+	once chan []byte
+}
+
+func (c *oneShotConn) Recv(ctx context.Context, b *bin.Buffer) error {
+	select {
+	case msg := <-c.once:
+		b.ResetN(0)
+		b.Put(msg)
+		return nil
+	default:
+		return c.blackholeConn.Recv(ctx, b)
+	}
+}
+
+// idPayload encodes only a TL type id, so handleMessage's PeekID routes it to
+// the default case -> Handler.OnMessage. The id is not any handled service
+// message type.
+type idPayload struct{}
+
+func (idPayload) Encode(b *bin.Buffer) error { b.PutID(0x12345678); return nil }
+func (idPayload) Decode(*bin.Buffer) error   { return nil }
+
+// TestReadLoop_TeardownDoesNotWaitOnStuckHandler is the regression for the
+// upstream circular deadlock: a per-conn readLoop must NOT block its return
+// (conn.Run) on an in-flight message handler that is parked delivering an
+// already-received update to the Client-level updates manager. Without the fix
+// readLoop's defer handlers.Wait() blocks on the stuck handler, conn.Run never
+// returns, reconnectUntilClosed never redials, getDifference never recovers on a
+// new conn, and the handler never drains — a deadlock that forced the worker's
+// full client-recreate workaround. With the fix readLoop stops waiting on ctx
+// cancel and conn.Run returns; the handler completes on its own once the manager
+// drains on the new connection (the update is not dropped).
+func TestReadLoop_TeardownDoesNotWaitOnStuckHandler(t *testing.T) {
+	a := require.New(t)
+
+	c := neo.NewTime(time.Now())
+	osc := &oneShotConn{blackholeConn: newBlackholeConn(), once: make(chan []byte, 1)}
+	conn := newWatchdogConn(t, osc, c, true)
+	conn.readTimeout = 0 // isolate the teardown path (watchdog disabled)
+
+	h := &blockingMsgHandler{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	conn.handler = h
+	defer close(h.release) // release the orphaned handler after the test
+
+	// Craft a self-decryptable server message routing to the default OnMessage.
+	var msg bin.Buffer
+	a.NoError(conn.newEncryptedMessage(conn.messageID.New(proto.MessageServerResponse), 0, idPayload{}, &msg))
+	osc.once <- append([]byte(nil), msg.Buf...)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	runErr := make(chan error, 1)
+	go func() {
+		runErr <- conn.Run(ctx, func(ctx context.Context) error {
+			<-ctx.Done()
+			return ctx.Err()
+		})
+	}()
+
+	// Wait until the handler is parked inside OnMessage.
+	select {
+	case <-h.entered:
+	case <-time.After(3 * time.Second):
+		a.Fail("handler never invoked — crafted message did not reach OnMessage")
+	}
+
+	// Cancel the connection. readLoop must return WITHOUT waiting for the stuck
+	// handler, so conn.Run returns.
+	cancel()
+	select {
+	case <-runErr:
+		// GREEN: conn.Run unwound despite the parked handler.
+	case <-time.After(5 * time.Second):
+		a.Fail("conn.Run wedged: readLoop blocked on a stuck update handler at teardown")
+	}
+}
+
 // waitFor polls cond up to ~2s, failing the test if it never holds. Used to
 // synchronize on goroutine startup (not as a substitute for clock advancement).
 func waitFor(tb testing.TB, cond func() bool) {

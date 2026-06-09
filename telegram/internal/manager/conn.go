@@ -516,8 +516,13 @@ func (c *Conn) initVersion() int64 {
 // regenerated on every reconnect; keying the init version off it would bust the
 // cache on every connection and defeat the purpose. We therefore use the stable
 // permanent key (PermKey) in PFS — init state is bound to the permanent key and
-// survives temporary-key rotation, matching the official client. Outside PFS,
-// PermKey is zero and Key is the long-lived key.
+// survives temporary-key rotation. NOTE: this is a deliberate gotd-specific
+// choice, NOT a copy of the official client (which re-inits on temp-key
+// rotation). The trade-off is that the server may answer the first bare request
+// after a reconnect with CONNECTION_NOT_INITED; init() self-heals that by
+// dropping the cache entry and sending a full initConnection (one extra RTT,
+// once per affected reconnect). Outside PFS, PermKey is zero and Key is the
+// long-lived key.
 func (c *Conn) authKeyID() int64 {
 	s := c.proto.Session()
 	if !s.PermKey.Zero() {

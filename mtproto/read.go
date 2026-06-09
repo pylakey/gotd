@@ -192,7 +192,30 @@ func (c *Conn) readLoop(ctx context.Context) (err error) {
 		// To wait all spawned goroutines
 		handlers sync.WaitGroup
 	)
-	defer handlers.Wait()
+	// On a CLEAN exit wait for in-flight message handlers, but NEVER block the
+	// connection's teardown on them once ctx is canceled. A handler may be parked
+	// handing an already-received update to the CLIENT-LEVEL updates manager
+	// (which outlives this connection); that manager's own consumer can in turn
+	// be waiting on getDifference against THIS dying connection. Blocking the
+	// connection's teardown on such a handler deadlocks the reconnect:
+	// handlers.Wait -> conn.Run never returns -> reconnectUntilClosed never
+	// redials -> getDifference never recovers on a new conn -> the handler never
+	// drains. So on ctx cancel we stop waiting and let the handlers finish on
+	// their own: the update is still processed once the manager drains on the new
+	// connection (it is NOT dropped), and any per-conn rpc-result handler simply
+	// hits the already force-closed engine (a no-op). The decode already happened
+	// before the handler was spawned, so no dying-conn state is touched here.
+	defer func() {
+		done := make(chan struct{})
+		go func() {
+			handlers.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-ctx.Done():
+		}
+	}()
 
 	for {
 		// We've tried multiple ways to reduce allocations via reusing buffer,
