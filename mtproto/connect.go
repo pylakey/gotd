@@ -2,6 +2,7 @@ package mtproto
 
 import (
 	"context"
+	"sync"
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/log"
@@ -39,11 +40,91 @@ func (c *Conn) connect(ctx context.Context) (rErr error) {
 		return errors.Wrap(err, "dial failed")
 	}
 	c.conn = conn
+
+	// Set by the watcher below when it force-closes conn, and read by the
+	// normalization defer. Declaration order here is load-bearing: defers run
+	// LIFO, so this one is declared FIRST to run LAST, after both the wait for
+	// the watcher and the close-on-error defer have had their say on rErr.
+	// Reordering it does not silently misbehave -- the read would then race
+	// the watcher's write and the race detector fails the build.
+	var closedByWatcher bool
 	defer func() {
-		if rErr != nil {
-			multierr.AppendInto(&rErr, conn.Close())
+		// Report a watcher-forced close as the context error it actually was.
+		// Closing the socket surfaces in the parked read as a raw transport
+		// failure ("use of closed network connection"), which would break
+		// callers using errors.Is to tell cancellation from a genuine
+		// transport fault. multierr.Append keeps the transport cause alongside
+		// the context error instead of discarding it.
+		//
+		// Keyed on the watcher having fired, not on a context being done: a
+		// genuine exchange failure that merely coincides with cancellation
+		// must not be relabelled.
+		if rErr != nil && closedByWatcher {
+			rErr = errors.Wrap(multierr.Append(connectCtx.Err(), rErr), "connect")
 		}
 	}()
+
+	// Both the close-on-error defer below and the watcher can decide to close
+	// conn, and transport.Conn does not promise Close is safe to call twice.
+	// The guard is scoped to this call rather than to the Conn: connect may
+	// run more than once on the same Conn, and a Conn-scoped guard would turn
+	// every close after the first into a no-op.
+	var closeOnce sync.Once
+	closeTransport := func() error {
+		var err error
+		closeOnce.Do(func() { err = conn.Close() })
+		return err
+	}
+
+	defer func() {
+		if rErr != nil {
+			multierr.AppendInto(&rErr, closeTransport())
+		}
+	}()
+
+	// The key exchange runs before Conn.Run starts its goroutine group, so
+	// handleClose -- which is what normally closes the socket on cancellation
+	// -- does not exist yet. transport.connection.Recv takes its deadline
+	// solely from ctx.Deadline() and never watches ctx.Done(), so a parked
+	// read can only be broken by closing the socket. Without this watcher,
+	// cancelling during the exchange does nothing at all, and callers that
+	// cancel and then wait (pool.DC.Close -> Supervisor.Wait) hang with it.
+	//
+	// Watches connectCtx rather than ctx because connectCtx is what drives
+	// the exchange. In PFS mode the two are the same; in non-PFS mode
+	// connectCtx additionally expires on dialTimeout, and a transport wrapper
+	// that ignores context deadlines would otherwise stay parked past it.
+	connectDone := make(chan struct{})
+	watcherDone := make(chan struct{})
+	go func() {
+		defer close(watcherDone)
+		select {
+		case <-connectCtx.Done():
+			closedByWatcher = true
+			if err := closeTransport(); err != nil {
+				c.log.Debug(ctx, "Failed to close connection on cancel", log.Error(err))
+			}
+		case <-connectDone:
+		}
+	}()
+
+	// Declared last so it runs first: the watcher is joined before anything
+	// else inspects conn or rErr, which is what makes the two closers
+	// sequential rather than concurrent and what publishes closedByWatcher to
+	// the defers that follow. Waiting for watcherDone, rather than merely
+	// signalling connectDone, is also what keeps the watcher from outliving
+	// connect() as a stray goroutine.
+	//
+	// In non-PFS mode connectCtx has its own deferred cancel(), which fires on
+	// every return path including success, at what another goroutine sees as
+	// the same instant as connectDone. Two ready select cases are chosen at
+	// random, so this wait additionally guarantees the watcher decides while
+	// connectCtx.Done() can only be ready for a real reason.
+	defer func() {
+		close(connectDone)
+		<-watcherDone
+	}()
+
 	if c.pfs {
 		return c.connectPFS(ctx)
 	}
